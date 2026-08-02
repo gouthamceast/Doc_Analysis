@@ -3,7 +3,7 @@
 
 **Purpose of this document:** This captures everything worked out so far on the Contract Vectorization Architecture project — the reasoning behind each design decision, the terminology needed to follow the domain, and the open questions still needing answers from other teams. It's written to be readable by a person new to contract analysis, and also structured enough to hand to an AI coding assistant (e.g. Claude Code) as project context/instructions before implementation work begins.
 
-**How to use this with Claude Code:** Paste or reference this file at the start of a build session. Treat Sections 1–8 as design decisions already made. Treat Section 10 ("Open Questions") as unresolved — if an implementation detail depends on one of those answers, ask rather than assume, or implement behind a config flag that can be adjusted once the real answer comes back from the relevant team.
+**How to use this with Claude Code:** Paste or reference this file at the start of a build session. Treat Sections 1–9 as design decisions already made. Treat Section 10 ("Open Questions") as unresolved — if an implementation detail depends on one of those answers, ask rather than assume, or implement behind a config flag that can be adjusted once the real answer comes back from the relevant team.
 
 ---
 
@@ -151,7 +151,62 @@ Additional guardrails to build in:
 
 ---
 
-## 7. Chunking Strategy
+## 7. Vector Storage: Neo4j vs. Vertex AI Data Store
+
+There are two viable places to store chunk embeddings — worth deciding deliberately rather than defaulting to whichever tool comes up first.
+
+**Option A — keep them separate (matches the original architecture diagram).** Vertex AI Data Store handles chunking, embedding, and vector search for full document text (Layer 1). Neo4j holds only the graph — `Contract`, `ContractVersion`, `Party`, `Clause`, `Milestone`, etc. (Layer 2) — cross-referenced to Vertex AI chunks by a shared chunk ID. Pro: Vertex AI's managed pipeline already does OCR/layout-parsing/chunking, so nothing is duplicated. Con: two systems to keep in sync, and a hybrid query (vector search → graph expand) requires a round trip between two services.
+
+**Option B — native vectors in Neo4j.** Neo4j has supported vector indexes since version 5.13 (GA), and as of the 2026.01 release added a native Cypher `SEARCH` clause for querying them (the older `db.index.vector.queryNodes()` procedure still works but is deprecated as of the 2026.04 release). Embeddings get stored directly as a property on `Chunk`/`Clause` nodes and indexed. Pro: one system — a single Cypher query can combine vector similarity search *and* graph traversal, which is exactly the "vector finds the entry point, graph expands with precise relationships" pattern from Section 6. Con: Neo4j doesn't generate embeddings itself (an embedding model call is still required), and the vector index becomes something your team tunes/scales rather than something fully managed.
+
+**Recommendation: don't treat it as all-or-nothing.** Use Vertex AI for what it's already good at — parsing and chunking raw documents at scale (rebuilding that inside Neo4j would be wasted effort). Also add a native vector index on the graph's `Chunk`/`Clause` nodes so an agent can run a single hybrid query instead of two service calls. Vertex AI can remain the primary managed vector store over full document chunks; Neo4j's index can cover a smaller, graph-native set (e.g. extracted clauses) for combined semantic + structural queries.
+
+**Deployment.** Neo4j is cloud-agnostic, but given the rest of this stack is GCP (GCS, Vertex AI, IAM) and the ITAR/export-control sensitivity already flagged for aerospace contract content, keep Neo4j on GCP too — either AuraDB (Neo4j's managed offering, available via GCP Marketplace) or self-managed on GCP Compute/GKE. Confirm with IT Security (Section 10), but this is the sensible default.
+
+**Creating a vector index on Neo4j nodes:**
+
+```cypher
+CREATE VECTOR INDEX chunkEmbeddings IF NOT EXISTS
+FOR (c:Chunk)
+ON c.embedding
+OPTIONS { indexConfig: {
+ `vector.dimensions`: 768,
+ `vector.similarity_function`: 'cosine'
+}}
+```
+
+Dimension count must match whatever embedding model generates the vectors (e.g. 768 or 1536, depending on the model — Neo4j doesn't decide this, it just needs to be told).
+
+**Querying it (current Cypher `SEARCH` syntax):**
+
+```cypher
+MATCH (queryChunk) WHERE queryChunk.id = $inputChunkId
+MATCH (c:Chunk)
+  SEARCH c IN (
+    VECTOR INDEX chunkEmbeddings
+    FOR queryChunk.embedding
+    LIMIT 10
+  ) SCORE AS score
+RETURN c.text, c.contractId, score
+```
+
+Extend this in the same query with a graph traversal (e.g. `MATCH (c)-[:CONTAINS]-(cl:Clause)`) to pull in related structured facts in one call — the actual payoff of putting vectors in the graph rather than a fully separate store.
+
+**Keep these three steps distinct when building this — they are not one LLM call on a raw document:**
+1. **Structural parsing** (deterministic) — Vertex AI's layout parser/Document AI turns a PDF into headings/tables/paragraphs as distinct blocks.
+2. **Embedding generation** (embedding model, not a generative LLM) — takes chunk text, returns a fixed-length vector.
+3. **Entity/relationship extraction** (LLM, scoped to individual chunks) — pulls parties/clauses/milestones/payment terms into the graph, per the schema in Section 6.
+
+Feeding a whole raw document straight to an LLM and asking it to produce both the graph and the embeddings in one shot skips step 1 and is what causes the table-splitting and number-hallucination problems described in Section 8 (Chunking Strategy).
+
+**Docs to check:**
+- [Vector indexes — Cypher Manual](https://neo4j.com/docs/cypher-manual/current/indexes/semantic-indexes/vector-indexes/)
+- [Vector search with filters in Neo4j](https://neo4j.com/blog/genai/vector-search-with-filters-in-neo4j-v2026-01-preview/)
+- [Vector optimization — Neo4j Aura](https://neo4j.com/docs/aura/managing-instances/vector-optimization/)
+
+---
+
+## 8. Chunking Strategy
 
 ### Why naive fixed-size chunking fails for contracts
 
@@ -175,7 +230,7 @@ Tables carrying financial/schedule data are good candidates for **structured ext
 
 ---
 
-## 8. Vertex AI Data Store — Does It Chunk Automatically?
+## 9. Vertex AI Data Store — Does It Chunk Automatically?
 
 **Short answer: yes, but with caveats worth verifying against your own documents before relying on it.**
 
@@ -203,7 +258,7 @@ Configurable parameters exist for tuning this — including chunk size and an "i
 
 ---
 
-## 9. Open Questions & Who to Reach Out To
+## 10. Open Questions & Who to Reach Out To
 
 A consolidated list of everything flagged as needing confirmation from another team before implementation can be finalized.
 
@@ -235,7 +290,7 @@ A consolidated list of everything flagged as needing confirmation from another t
 
 ---
 
-## 10. Suggested Build Order
+## 11. Suggested Build Order
 
 1. **Phase 0 — Scoping & pilot set.** Confirm LEAP's webhook/metadata capabilities. Pick a small, deliberately messy pilot corpus covering signature pages, tables, multi-exhibit SOWs, government FAR contracts.
 2. **Phase 1 — Ingestion & vectorization.** Stand up GCS landing zone with least-privilege IAM, build/validate the Vertex AI Data Store pipeline (parsing, structure-aware chunking, embedding) against the pilot set.
