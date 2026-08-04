@@ -155,6 +155,10 @@ Additional guardrails to build in:
 
 There are two viable places to store chunk embeddings — worth deciding deliberately rather than defaulting to whichever tool comes up first.
 
+**Where to draw the line: what data goes in which store.** This is the single most common point of confusion, and the fix is one rule rather than a complicated framework: **the vector store gets everything, in full; the graph gets only what's worth computing or traversing, and it points back to the vector store instead of duplicating text.** Every chunk goes to the vector store — comprehensive, nothing left unsearchable. A subset of chunks *also* feeds extracted facts into the graph, as a sparse, structured distillation that links back to its source chunk by ID rather than copying its text.
+
+A quick test for any given piece of information: if two people could phrase it differently and you'd still want to find it ("does this contract have exclusivity restrictions?"), it belongs in the vector store. If it's a specific number, date, name, or relationship that needs to be exactly right and traceable ("what's the cumulative liability at month 9," "which contracts reference this ICD"), it belongs in the graph. Concretely: a `Clause` node in the graph does not hold the clause's full prose — it holds a short label plus a `chunk_id` pointer back to where the real text lives in the vector store. The graph is never a competing copy of the text; it's a derived index over the facts worth making computable.
+
 **Option A — keep them separate (matches the original architecture diagram).** Vertex AI Data Store handles chunking, embedding, and vector search for full document text (Layer 1). Neo4j holds only the graph — `Contract`, `ContractVersion`, `Party`, `Clause`, `Milestone`, etc. (Layer 2) — cross-referenced to Vertex AI chunks by a shared chunk ID. Pro: Vertex AI's managed pipeline already does OCR/layout-parsing/chunking, so nothing is duplicated. Con: two systems to keep in sync, and a hybrid query (vector search → graph expand) requires a round trip between two services.
 
 **Option B — native vectors in Neo4j.** Neo4j has supported vector indexes since version 5.13 (GA), and as of the 2026.01 release added a native Cypher `SEARCH` clause for querying them (the older `db.index.vector.queryNodes()` procedure still works but is deprecated as of the 2026.04 release). Embeddings get stored directly as a property on `Chunk`/`Clause` nodes and indexed. Pro: one system — a single Cypher query can combine vector similarity search *and* graph traversal, which is exactly the "vector finds the entry point, graph expands with precise relationships" pattern from Section 6. Con: Neo4j doesn't generate embeddings itself (an embedding model call is still required), and the vector index becomes something your team tunes/scales rather than something fully managed.
@@ -292,6 +296,8 @@ A consolidated list of everything flagged as needing confirmation from another t
 
 ## 11. Suggested Build Order
 
+**High-level phases:**
+
 1. **Phase 0 — Scoping & pilot set.** Confirm LEAP's webhook/metadata capabilities. Pick a small, deliberately messy pilot corpus covering signature pages, tables, multi-exhibit SOWs, government FAR contracts.
 2. **Phase 1 — Ingestion & vectorization.** Stand up GCS landing zone with least-privilege IAM, build/validate the Vertex AI Data Store pipeline (parsing, structure-aware chunking, embedding) against the pilot set.
 3. **Phase 2 — Knowledge graph.** Implement the schema in Section 6, build LLM extraction with an accuracy eval set (ground-truth answers for dollar figures, dates, percentages), then layer in reference resolution.
@@ -299,6 +305,116 @@ A consolidated list of everything flagged as needing confirmation from another t
 5. **Cross-cutting, throughout:** governance/security and audit logging from day one; observability layered in before wide consumer rollout.
 6. **Phase 4 — Consumer rollout.** Roll out to one business unit or contract type at a time, with a feedback loop back into the eval set.
 
+**Step-by-step getting-started checklist** (ordered so each layer is validated before building on top of it, rather than debugging everything at once):
+
+1. **Pick a small pilot set and get GCP/Neo4j running.** Use 5-10 contracts that already stress-test the hard cases (multi-page tables, government forms, wage tables, large appendices). Stand up a GCS bucket, a Vertex AI Search data store, and a Neo4j instance (AuraDB is fine to start). Skip Workato and LEAP entirely at this stage — manually upload the pilot files to GCS.
+2. **Prove chunking works before writing any extraction code.** Turn on the layout parser in Vertex AI Search, ingest the pilot set, and inspect the resulting chunks directly: are tables kept intact with headers attached? Is the ancestor heading preserved? What's the real chunk size? Fix this here — everything downstream depends on chunk quality.
+3. **Hand-build a small slice of the graph before automating it.** Take one pilot contract and manually create its `Contract`, `ContractVersion`, a couple of `Party` nodes, and a few `Milestone`/`PaymentTerm` nodes by writing Cypher directly. This surfaces schema problems immediately, before an automated pipeline can generate them silently at scale.
+4. **Build LLM extraction, scoped per chunk, with an eval set from day one.** Write extraction prompts targeted at specific entity types (parties, milestones, payment terms, clause references), run against individual chunks — not whole documents. Write down 10-15 ground-truth answers yourself first (e.g. "what's the cumulative liability at EDC+9") and confirm the pipeline reproduces them exactly before scaling past the pilot.
+5. **Add reference resolution once the pilot set actually cross-references itself.** The intra- vs. inter-document logic and unresolved-placeholder matching (Section 6) only proves out once at least one pilot contract cites another or a shared external document.
+6. **Test the revision/amendment flow deliberately.** Simulate or use a real revised version of one pilot contract, and confirm: chunk-hash comparison flags only the changed sections, the vector store marks the old revision superseded, and the graph creates a new `ContractVersion` with a `SUPERSEDES` edge.
+7. **Only now wire up Workato and LEAP.** By this point the pipeline logic is proven on manually-uploaded files, so automating the trigger is plumbing, not plumbing plus unproven logic at the same time.
+8. **Build the actual hybrid query.** Vector search finds the relevant chunk; a graph traversal expands from there to related structured facts. Test with realistic business-user questions, not just technical ones.
+9. **Wrap governance/access control around the pilot** before expanding past it — foundational, not retrofitted (Section 2).
+10. **Expand deliberately** — one contract type or business unit at a time, not a full LEAP backfill on day one.
+
 ---
 
-*This document reflects design decisions and open questions as of the working session it was generated from. Update it as answers come back from the teams listed in Section 9, and before treating any item there as decided.*
+## 12. Technical Reference: Data Shapes, Ingestion & Retrieval Queries
+
+Concrete detail on what actually gets stored and queried — the implementable layer underneath Sections 6-8.
+
+### 12.1 Embedding Model
+
+**Recommendation: `gemini-embedding-001`** (GA on Vertex AI). Default output is 3,072 dimensions, with Matryoshka truncation supported down to 1,536 or 768 with minimal quality loss. **Use 768** for production — smaller index, faster search, lower storage cost in both Vertex AI and Neo4j.
+
+**Important asymmetry to get right:** the API takes a `task_type` parameter. Chunks are embedded with `task_type=RETRIEVAL_DOCUMENT` at ingestion time; the user's question is embedded with `task_type=RETRIEVAL_QUERY` at query time. Same model, different task type — the model produces different vectors optimized for each side ("this is a thing to be found" vs. "this is what I'm looking for"). Using the wrong one on either side quietly degrades match quality with no error thrown.
+
+### 12.2 Chunk / Vector Record Shape
+
+What one chunk record actually looks like inside the vector index:
+
+```json
+{
+  "chunk_id": "S0637980_rev2_sec-exhibitD_0012",
+  "contract_id": "S0637980",
+  "revision": 2,
+  "document_type": "SOW",
+  "section_path": "Exhibit D > Termination Liability Schedule",
+  "page": 29,
+  "content_type": "table",
+  "text": "EDC+9: Liability 15%, Cumulative 65%, Amount $1,091,700, Cumulative $4,730,700",
+  "embedding": [0.0182, -0.0091, 0.0447, "...", -0.0026],
+  "embedding_dims": 768,
+  "superseded": false,
+  "ingested_at": "2026-08-04T06:12:33Z"
+}
+```
+
+`chunk_id` is deterministic (hash of contract_id + revision + section + index), not random — re-running ingestion on the same document produces the same IDs instead of duplicates.
+
+### 12.3 Graph Ingestion
+
+Uniqueness constraints go in first, so `MERGE` behaves correctly and stays fast as the graph grows:
+
+```cypher
+CREATE CONSTRAINT contract_id IF NOT EXISTS FOR (c:Contract) REQUIRE c.contract_id IS UNIQUE;
+CREATE CONSTRAINT version_id IF NOT EXISTS FOR (cv:ContractVersion) REQUIRE (cv.contract_id, cv.revision) IS NODE KEY;
+CREATE CONSTRAINT doc_number IF NOT EXISTS FOR (d:Document) REQUIRE d.document_number IS UNIQUE;
+```
+
+Ingestion runs as one `MERGE`-based transaction per chunk's extracted JSON, safe to re-run:
+
+```cypher
+MERGE (c:Contract {contract_id: $contract_id})
+MERGE (cv:ContractVersion {contract_id: $contract_id, revision: $revision})
+MERGE (c)-[:CURRENT_VERSION]->(cv)
+WITH cv
+UNWIND $milestones AS ms
+  MERGE (m:Milestone {contract_id: $contract_id, revision: $revision, name: ms.name})
+  SET m.date_offset = ms.date_offset
+  MERGE (cv)-[:HAS_MILESTONE]->(m)
+  WITH cv, m, ms
+  UNWIND ms.payment_terms AS pt
+    MERGE (p:PaymentTerm {contract_id: $contract_id, revision: $revision, milestone_ref: ms.name})
+    SET p.percent = pt.percent, p.cumulative_percent = pt.cumulative_percent,
+        p.amount_usd = pt.amount_usd, p.source_chunk_id = $chunk_id
+    MERGE (m)-[:TRIGGERS_PAYMENT]->(p)
+```
+
+### 12.4 Probable Retrieval Queries
+
+The vector search request sent to Vertex AI (question embedded with `RETRIEVAL_QUERY`, filtered to what the user is permitted to see, and to the latest revision by default):
+
+```json
+{
+  "query_embedding": [0.0091, -0.0033, "...", 0.0128],
+  "neighbor_count": 8,
+  "filter": "contract_id IN ('S0637980','S0662570') AND superseded = false"
+}
+```
+
+The follow-up graph query, using the `contract_id` returned above, that retrieves the exact structured figures rather than trusting matched text alone:
+
+```cypher
+MATCH (cv:ContractVersion {contract_id: $contract_id})-[:CONTAINS]->(:Clause)-[:REFERENCES]->
+  (d:Document {document_type: "TerminationLiabilitySchedule"})
+MATCH (cv)-[:HAS_MILESTONE]->(m:Milestone {name: "CDR"})-[:TRIGGERS_PAYMENT]->(p:PaymentTerm)
+RETURN m.date_offset, p.percent, p.cumulative_percent, p.amount_usd, p.source_chunk_id
+```
+
+The `source_chunk_id` returned here is what lets the final answer cite the exact passage it came from.
+
+### 12.5 Query Router: When to Query the Graph
+
+Three ways to decide whether a given question needs the graph hop, in order of maturity:
+
+1. **Always query both (recommended for the pilot).** Run vector search, and for whatever `contract_id`s come back, also run a cheap Neo4j lookup keyed on that ID. No match just means an empty, harmless result. No classification logic to build or debug — the right choice while everything else in the pipeline is still unproven.
+2. **Rule-based heuristic.** Plain code (no LLM call) scanning the question for signals of a computable fact — dollar signs, percentages, date phrases, words like "cumulative," "total," "how much," "which contracts reference." Fast and free, but brittle — a differently-phrased structured question can silently slip past it with no error.
+3. **Tool-calling / agentic router (the more durable long-term pattern).** Expose `vector_search` and `graph_query` as callable tools to the answering LLM itself, and let it decide during its own reasoning which to call and in what order — the same pattern behind most current agentic RAG systems. Adapts to phrasing naturally and can chain (search, notice a number needs verifying, call graph), at the cost of extra latency and needing its own eval set to confirm it's actually calling the graph when it should.
+
+**Recommended path:** start with option 1 for the pilot (Section 11), move to option 3 once the core pipeline is validated and latency/cost at scale becomes the real constraint. Option 2 is a maintenance trap best skipped — it never fully closes the gap that option 3 closes properly. This router is custom orchestration code sitting between the API layer and the two databases; neither Vertex AI nor Neo4j provides it.
+
+---
+
+*This document reflects design decisions and open questions as of the working session it was generated from. Update it as answers come back from the teams listed in Section 10, and before treating any item there as decided.*
