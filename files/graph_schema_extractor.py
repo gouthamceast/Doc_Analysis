@@ -40,14 +40,23 @@ directly onto the Contract node. If absent, fall back to LLM extraction
 from the narrative text. Hook point: `metadata_lookup()` below is a stub
 for this -- currently always returns None (i.e. "always extract").
 
-Usage
------
-    export OPENAI_API_KEY=sk-...
+Usage (Azure OpenAI)
+--------------------
     uv add openai pypdf networkx matplotlib
 
+    export AZURE_OPENAI_API_KEY=<your subscription key>
+    export AZURE_OPENAI_ENDPOINT=https://<your-resource-name>.openai.azure.com
+    export AZURE_OPENAI_API_VERSION=2024-08-01-preview   # match your resource's supported version
+    export AZURE_OPENAI_DEPLOYMENT=<your deployment name>   # e.g. "gpt-4o-mini-deploy" -- NOT the base model name
+
     uv run graph_schema_extractor.py \
-        --pdf "SmallBusinessSubcontractingPlan.pdf" \
-        --pdf "EMSDefenseTrack1FE.pdf" \
+        --pdf-dir "./contracts" \
+        --out ./graph_recon
+
+    # or mix explicit files + a directory, and recurse into subfolders:
+    uv run graph_schema_extractor.py \
+        --pdf "special_case.pdf" \
+        --pdf-dir "./contracts" --recursive \
         --out ./graph_recon
 """
 
@@ -59,10 +68,13 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-from openai import OpenAI
+from dotenv import load_dotenv
+from openai import AzureOpenAI
 from pypdf import PdfReader
 
-MODEL = "gpt-4o-mini"
+load_dotenv()  # reads .env in the current working directory (if present)
+
+MODEL = "gpt-4o-mini"  # overwritten with your Azure deployment name in main()
 
 # ---------------------------------------------------------------------------
 # Structured metadata fields (from your existing 54-column dataframe).
@@ -187,7 +199,7 @@ def extract_pages_text(pdf_path: str) -> list[str]:
     return [page.extract_text() or "" for page in reader.pages]
 
 
-def call_model(client: OpenAI, page_text: str, page_num: int, doc_name: str) -> dict:
+def call_model(client: AzureOpenAI, page_text: str, page_num: int, doc_name: str) -> dict:
     if not page_text.strip():
         return {"nodes": [], "edges": [], "suggested_new_types": []}
 
@@ -210,7 +222,7 @@ def call_model(client: OpenAI, page_text: str, page_num: int, doc_name: str) -> 
     return {"nodes": [], "edges": [], "suggested_new_types": []}
 
 
-def process_pdf(client: OpenAI, pdf_path: str, out_dir: Path) -> list[dict]:
+def process_pdf(client: AzureOpenAI, pdf_path: str, out_dir: Path) -> list[dict]:
     doc_name = Path(pdf_path).stem
     print(f"\n=== Processing {doc_name} ===")
     pages = extract_pages_text(pdf_path)
@@ -344,21 +356,67 @@ def render_diagrams(all_results: list[dict], out_dir: Path) -> None:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pdf", action="append", required=True, help="Path to a contract PDF (repeatable)")
+    parser.add_argument("--pdf", action="append", default=[], help="Path to a single contract PDF (repeatable)")
+    parser.add_argument("--pdf-dir", action="append", default=[],
+                         help="Path to a directory of contract PDFs (repeatable). "
+                              "All *.pdf files directly inside it are processed.")
+    parser.add_argument("--recursive", action="store_true",
+                         help="With --pdf-dir, also search subdirectories for PDFs.")
     parser.add_argument("--out", default="./graph_recon", help="Output directory")
     args = parser.parse_args()
+
+    pdf_paths = list(args.pdf)
+    for d in args.pdf_dir:
+        d = Path(d)
+        if not d.is_dir():
+            raise SystemExit(f"--pdf-dir path is not a directory: {d}")
+        pattern = "**/*.pdf" if args.recursive else "*.pdf"
+        found = sorted(d.glob(pattern))
+        if not found:
+            print(f"  [warn] no PDFs found in {d} (recursive={args.recursive})")
+        pdf_paths.extend(str(p) for p in found)
+
+    # de-dupe while preserving order, in case a file was passed both ways
+    seen = set()
+    pdf_paths = [p for p in pdf_paths if not (p in seen or seen.add(p))]
+
+    if not pdf_paths:
+        raise SystemExit("No PDFs to process. Pass --pdf FILE (repeatable) and/or --pdf-dir DIR.")
+
+    print(f"Found {len(pdf_paths)} PDF(s) to process:")
+    for p in pdf_paths:
+        print(f"  - {p}")
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise SystemExit("Set OPENAI_API_KEY in your environment first.")
-    client = OpenAI(api_key=api_key)
+    api_key = os.environ.get("AZURE_OPENAI_API_KEY")
+    endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")       # target URI, e.g. https://<resource>.openai.azure.com
+    api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
+    deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT")   # your deployment name, NOT the base model name
+
+    missing = [k for k, v in {
+        "AZURE_OPENAI_API_KEY": api_key,
+        "AZURE_OPENAI_ENDPOINT": endpoint,
+        "AZURE_OPENAI_DEPLOYMENT": deployment,
+    }.items() if not v]
+    if missing:
+        raise SystemExit(f"Missing required env var(s): {', '.join(missing)}")
+
+    client = AzureOpenAI(
+        api_key=api_key,
+        azure_endpoint=endpoint,
+        api_version=api_version,
+    )
+    global MODEL
+    MODEL = deployment  # Azure routes by deployment name, not model name
 
     all_results = []
-    for pdf_path in args.pdf:
-        all_results.extend(process_pdf(client, pdf_path, out_dir))
+    for pdf_path in pdf_paths:
+        try:
+            all_results.extend(process_pdf(client, pdf_path, out_dir))
+        except Exception as e:
+            print(f"  [error] failed on {pdf_path}: {e} -- skipping, continuing with rest")
 
     summary = summarize(all_results)
     summary_out = out_dir / "combined_graph_summary.json"
