@@ -1,0 +1,2235 @@
+================================================================================
+  CONTRACT INTELLIGENCE PLATFORM — COMPLETE TECHNICAL REFERENCE
+  Honeywell Aerospace | Vertex AI Data Store + Neo4j AuraDB on GCP
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+  PART 1:  System Overview — What Every Service Does
+  PART 2:  Understanding Cypher — What It Returns and How It Answers Questions
+  PART 3:  Data Flow 1 — Ingestion (GCS → Vertex AI Data Store + Neo4j AuraDB)
+  PART 4:  Data Flow 2 — Retrieval (External Systems → Query API → Both Stores)
+  PART 5:  Ingestion Pipeline — Flaws in the Initial Version (with line refs)
+  PART 6:  Entity Resolution — Complete Design
+  PART 7:  Extraction Confidence — Scoring, Gating, Human Review
+  PART 8:  Cypher Template Library — All Query Categories
+  PART 9:  Caching — Four-Layer Implementation
+  PART 10: Keeping Two Systems in Sync
+  PART 11: Orchestration — Cloud Workflows, Query API, Vertex AI Agent
+  PART 12: Shortcomings — Ingestion and Retrieval
+  PART 13: Monitoring & Debugging — GCP Native and Datadog
+  PART 14: Quick-Reference Decision Matrix
+  PART 15: Implementation Priority Order
+
+
+================================================================================
+PART 1: SYSTEM OVERVIEW — WHAT EVERY SERVICE DOES
+================================================================================
+
+SOURCE SYSTEM: LEAP (Honeywell internal)
+  Contract storage system. When a contract is finalized ("frozen"), LEAP holds
+  the canonical copy. All downstream systems read from LEAP, not email or file
+  shares. LEAP creates a new frozen revision whenever a contract is amended.
+
+INTEGRATION LAYER: Workato
+  iPaaS (integration platform). Two recipes are needed:
+  1. Event-driven recipe (ongoing): fires when LEAP freezes a contract →
+     pushes PDF + metadata to GCS. This is the real-time feed.
+  2. Batch backfill recipe (one-time): exports all historically frozen contracts
+     to GCS. Run this first, then switch on the event-driven recipe.
+
+  Metadata that MUST travel with every file from Workato (attached as GCS
+  object metadata so every downstream service that reads the file gets it):
+    - contract_id            (stable across revisions)
+    - revision_number
+    - freeze_timestamp
+    - document_type          (main agreement, SOW, exhibit, amendment, etc.)
+    - confidentiality_marking (carry from LEAP — do not re-derive downstream)
+    - parent_contract_id     (if this is an amendment or child agreement)
+
+  Idempotency: tag each push with contract_id + revision + freeze_timestamp
+  so a retried Workato webhook doesn't create duplicate ingestion events.
+
+STORAGE LANDING ZONE: Google Cloud Storage (GCS)
+  Two buckets:
+    gs://contracts-raw/          ← Workato writes here
+    gs://contracts-processed/    ← pipeline writes extracted text, audit logs
+
+VECTOR DATABASE: Vertex AI Data Store
+  A managed, fully serverless document search service. You point it at a GCS
+  path and it handles OCR, chunking, embedding, and vector indexing automatically.
+  What you control: which GCS bucket to import from, import triggers, search
+  configuration (semantic / full-text / hybrid), access control.
+  What it controls (opaque to you): how it chunks documents, which embedding
+  model it uses, indexing schedule (documents become searchable in 2–10 minutes).
+
+GRAPH DATABASE: Neo4j AuraDB (managed Neo4j on GCP)
+  Fully managed Neo4j. Connect via the Bolt protocol using the standard Python
+  driver — same code as self-hosted Neo4j. Choose the same GCP region as your
+  Cloud Run services to minimize connection latency.
+  Tiers:
+    AuraDB Professional: up to 100 concurrent connections, shared compute.
+                         OK for development and early staging.
+    AuraDB Enterprise:   dedicated compute, 300+ connections, SLA.
+                         Required for production.
+
+INGESTION ORCHESTRATOR: Cloud Workflows
+  Lightweight, fully serverless step orchestration. No infrastructure. Executes
+  sequences of HTTP API calls with built-in retry, parallelism, and visual
+  execution history in the GCP Console. Not Cloud Composer (Airflow) — that is
+  heavier, built for complex ML pipelines with dozens of DAG steps.
+
+CUSTOM INGESTION SERVICE: Cloud Run (Neo4j ingestion service)
+  A containerized FastAPI service that:
+    1. Receives a Pub/Sub push message with GCS URI + contract metadata
+    2. Downloads the PDF from GCS
+    3. Sends pages to Document AI for OCR (more accurate than GPT vision for
+       scanned/photographed documents)
+    4. Calls LLM (Gemini or GPT-4o) to extract entities and relationships
+    5. Runs EntityResolver for canonical name deduplication
+    6. Writes nodes and edges to AuraDB via Bolt (MERGE, not CREATE)
+    7. Returns AuraDB node element_ids to Cloud Workflows
+
+BRIDGE / MAPPING LAYER: Firestore
+  A lookup table mapping Vertex AI Data Store document IDs to AuraDB node IDs.
+  This is the critical link between the two stores at query time. Without it,
+  semantic search results from Data Store cannot be connected to graph nodes
+  in AuraDB. See Part 10 for a full explanation of why this matters.
+
+QUERY API (UNIFIED FRONT DOOR): Cloud Run (Query API service)
+  The only entry point for all external callers. Internal or external systems
+  NEVER query AuraDB or Data Store directly. This service:
+    - Authenticates the caller and checks access scope
+    - Classifies query intent (LLM call to Gemini Flash)
+    - Routes to Data Store, AuraDB, or both in parallel
+    - Merges results and looks up the Firestore bridge
+    - Calls LLM for final answer generation
+    - Returns a unified structured response
+    - Emits structured logs and traces
+
+EVENT BUS: Cloud Pub/Sub
+  Two topics:
+    contracts-landed:    GCS fires this when a new file arrives.
+                         Cloud Workflows subscribes to start ingestion.
+    ingestion-complete:  Cloud Workflows fires this when both branches
+                         (Data Store + AuraDB) have succeeded.
+                         Cache warmers, notification services subscribe.
+
+CACHE LAYER: Cloud Memorystore (managed Redis)
+  Caches Cypher template results keyed by (template_name + slots).
+  TTL is dynamic: tied to how recently the returned contracts were last ingested.
+  Also caches vector search results and Firestore mapping lookups.
+
+ANALYTICS EXPORT: BigQuery + Looker
+  A nightly APOC export from AuraDB → GCS → BigQuery. BI tools connect to
+  BigQuery for dashboards. This is read-only, 24h-lagged, and completely
+  separate from the real-time Query API path.
+
+
+================================================================================
+PART 2: UNDERSTANDING CYPHER — WHAT IT RETURNS AND HOW IT ANSWERS QUESTIONS
+================================================================================
+
+THIS IS THE MOST IMPORTANT THING TO UNDERSTAND ABOUT THE PIPELINE.
+
+Cypher queries return nodes and relationships — but nodes and relationships are
+just CONTAINERS FOR PROPERTIES (key-value data). When Cypher returns a node,
+it returns all the properties written onto that node during ingestion.
+
+The properties ARE the information. Cypher is just a retrieval mechanism.
+
+TRACE THROUGH A COMPLETE EXAMPLE
+----------------------------------
+
+User asks: "What milestones are due for Boeing contracts this year?"
+
+Step 1: Cypher template executes
+  MATCH (p:Party)<-[:PARTY_TO]-(c:Contract)-[:HAS_MILESTONE]->(m:Milestone)
+  WHERE p.canonical_name =~ '(?i).*Boeing.*'
+    AND date(m.date) >= date('2026-01-01')
+    AND date(m.date) <= date('2026-12-31')
+  RETURN c.contract_id, c.sales_contract_status,
+         m.label, m.date, m.value
+  ORDER BY m.date
+
+Step 2: Neo4j returns Python records (rows of property values)
+  [
+    {"c.contract_id": "HC-2023-001", "c.sales_contract_status": "Active",
+     "m.label": "PDR",  "m.date": "2026-03-15", "m.value": "$450,000"},
+
+    {"c.contract_id": "HC-2023-001", "c.sales_contract_status": "Active",
+     "m.label": "CDR",  "m.date": "2026-09-01", "m.value": "$800,000"},
+
+    {"c.contract_id": "HC-2022-005", "c.sales_contract_status": "Active",
+     "m.label": "ATP",  "m.date": "2026-11-30", "m.value": "$1,200,000"},
+  ]
+  The dates, amounts, labels — these ARE the information. You wrote them
+  during ingestion. Cypher retrieves them. This is just a database query.
+
+Step 3: Serialize the records to plain text for the LLM
+  def serialize_for_llm(records: list[dict]) -> str:
+      lines = []
+      for r in records:
+          lines.append(
+              f"Contract {r['c.contract_id']} ({r['c.sales_contract_status']}): "
+              f"milestone '{r['m.label']}' due {r['m.date']}, value {r['m.value']}"
+          )
+      return "\n".join(lines)
+
+  Produces:
+    Contract HC-2023-001 (Active): milestone 'PDR' due 2026-03-15, value $450,000
+    Contract HC-2023-001 (Active): milestone 'CDR' due 2026-09-01, value $800,000
+    Contract HC-2022-005 (Active): milestone 'ATP' due 2026-11-30, value $1,200,000
+
+Step 4: Feed to LLM as context
+  prompt = f"""
+  You are a contract intelligence assistant for Honeywell Aerospace.
+  Answer the user's question using ONLY the data below.
+  Cite the contract_id for every fact you state.
+  Say "I don't have that information" if the data doesn't cover it.
+
+  DATA:
+  {serialized_graph_data}
+
+  QUESTION: {user_question}
+  """
+
+Step 5: LLM generates the answer
+  "Boeing has three milestones due in 2026. Contract HC-2023-001 has a
+   Preliminary Design Review (PDR) on March 15 worth $450,000 and a Critical
+   Design Review (CDR) on September 1 worth $800,000. Contract HC-2022-005 has
+   an Acceptance Test Procedure (ATP) on November 30 worth $1,200,000."
+
+WHAT THE GRAPH CAN AND CANNOT ANSWER
+--------------------------------------
+
+The graph answers questions about structured facts that were extracted
+and written as node/edge properties during ingestion:
+  - "What is the expiry date of HC-2023-001?"      YES (Contract.expiration_date)
+  - "Who are the parties?"                          YES (Party nodes + PARTY_TO)
+  - "What milestones exist and when are they due?"  YES (Milestone nodes)
+  - "How much is this contract worth?"              YES (Contract.value_usd)
+  - "Which standard FAR clauses are referenced?"    YES (Standard nodes)
+
+The graph CANNOT answer questions about raw contract text or clause wording:
+  - "What exactly does the indemnification clause say?"    NO
+  - "What are the specific termination conditions?"        NO
+  - "Show me the exact payment schedule language"          NO
+
+For those questions, Vertex AI Data Store holds the actual text as searchable
+chunks. The two stores answer different things:
+
+  User question
+       │
+       ├── "What are the milestone dates for Boeing?"
+       │        └──► Cypher → node properties → structured facts → LLM
+       │
+       ├── "What does the indemnification clause say?"
+       │        └──► Data Store semantic search → clause text → LLM
+       │
+       └── "Tell me everything about Boeing contract HC-2023-001"
+                ├──► Cypher → parties, dates, milestones, value (structured)
+                └──► Data Store → relevant clause text (unstructured)
+                Both → merged context → LLM → complete answer
+
+WHAT HAPPENS IF CYPHER RETURNS NOTHING?
+-----------------------------------------
+If the entity was never extracted into the graph (or was extracted incorrectly),
+Cypher returns an empty result set with no error. The LLM then says "I don't
+have that information" — which is correct but confusing to the user if the
+contract exists in the PDF.
+
+This is why ingestion quality is the most important thing. If the LLM wrote
+the wrong milestone date as a node property at ingestion time, Cypher will
+faithfully return the wrong date. Garbage in, garbage out.
+
+The vector store is the fallback: even if the graph has bad or missing data,
+Data Store can still find the raw contract text. But the structured precision
+(exact dates, amounts, party roles) only comes from the graph.
+
+THE COMPLETE PIPELINE CODE
+---------------------------
+  async def answer_question(question: str) -> str:
+      intent = await classify(question)
+      # intent = {"type": "hybrid", "template": "party_profile",
+      #           "slots": {"party_name": "Boeing"}}
+
+      results = {}
+
+      if intent["type"] in ("structured", "hybrid"):
+          cypher = TEMPLATE_REGISTRY[intent["template"]]["cypher"]
+          records = neo4j_session.run(cypher, **intent["slots"])
+          results["graph"] = serialize_for_llm(records)
+          # "Contract HC-2023-001 (Active): milestone CDR, 2026-09-01, $800K"
+
+      if intent["type"] in ("semantic", "hybrid"):
+          chunks = datastore_client.search(question, num_results=5)
+          results["text"] = "\n\n".join(c.content for c in chunks)
+          # "...Boeing shall indemnify and hold harmless Honeywell..."
+
+      context = ""
+      if "graph" in results:
+          context += f"STRUCTURED CONTRACT DATA:\n{results['graph']}\n\n"
+      if "text" in results:
+          context += f"CONTRACT CLAUSE TEXT:\n{results['text']}\n\n"
+
+      return llm.generate(
+          system="Answer using only the data provided. Cite contract IDs.",
+          user=f"DATA:\n{context}\n\nQUESTION: {question}"
+      )
+
+
+================================================================================
+PART 3: DATA FLOW 1 — INGESTION (GCS → VERTEX AI DATA STORE + NEO4J AURADB)
+================================================================================
+
+STEP-BY-STEP INGESTION WALKTHROUGH
+-------------------------------------
+
+Step 1: Contract freezes in LEAP
+  Workato recipe fires. Attaches metadata as GCS object metadata and pushes to:
+    gs://contracts-raw/{contract_id}/{revision}/contract.pdf
+
+Step 2: GCS fires "object finalized" event
+  Cloud Storage Notifications → Pub/Sub topic: contracts-landed
+  Message: {bucket, object_path, contract_id, revision, document_type,
+            confidentiality_marking, parent_contract_id}
+
+Step 3: Cloud Workflows receives the trigger
+  A Cloud Workflows trigger (connected to the Pub/Sub subscription) starts
+  a new workflow execution with the event payload.
+  First step: validate metadata. If contract_id or revision is missing,
+  route to dead-letter topic (contracts-metadata-error) and stop.
+  Never process an undocumented file.
+
+Step 4: Cloud Workflows runs two branches IN PARALLEL
+
+  BRANCH A — Vertex AI Data Store Import
+    Cloud Workflows calls the Data Store Documents API:
+      POST https://discoveryengine.googleapis.com/v1/projects/{PROJECT}/
+           locations/global/dataStores/{DATASTORE_ID}/branches/default_branch/
+           documents:import
+      Body: {
+        "gcsSource": {
+          "inputUris": ["gs://contracts-raw/{contract_id}/{revision}/contract.pdf"],
+          "dataSchema": "content"
+        },
+        "reconciliationMode": "INCREMENTAL"
+      }
+    Data Store handles the rest: OCR, text extraction, chunking, embedding,
+    indexing. No code to write. Returns a document_id for the ingested document.
+    Indexing lag: 2–10 minutes before the document is searchable.
+
+  BRANCH B — Neo4j AuraDB Ingestion (runs in parallel with Branch A)
+    Cloud Workflows calls the Cloud Run ingestion service:
+      POST https://ingestion-service.run.app/ingest
+      Body: {gcs_uri, contract_id, revision, document_type, parent_contract_id}
+
+    Inside the Cloud Run ingestion service:
+      a) Download PDF from GCS
+      b) Send to Document AI → clean structured text per page
+      c) For each page: call LLM with SYSTEM_PROMPT → {nodes, edges}
+      d) Run EntityResolver → canonical names, fuzzy dedup
+      e) For each node: AuraDB MERGE → capture element_id
+      f) For each edge: AuraDB MERGE with confidence gating
+         (low confidence → POSSIBLE_* prefix relationship)
+      g) Return {aura_node_ids: [...], nodes_written: N, edges_written: N}
+
+Step 5: Cloud Workflows waits for BOTH branches (join)
+  If either branch fails: retry up to 3 times with exponential backoff.
+  If both fail after 3 retries: publish to contracts-failed Pub/Sub topic.
+  If both succeed: proceed to Step 6.
+
+Step 6: Write the bridge mapping to Firestore
+  Only written when BOTH branches have confirmed success:
+    Collection: contract_mappings
+    Document ID: "{contract_id}_{revision}"
+    Fields:
+      contract_id, revision,
+      datastore_document_id (from Branch A),
+      aura_node_ids (from Branch B),
+      ingested_at, status: "complete",
+      ingestion_run_id (Cloud Workflows execution ID for audit)
+
+Step 7: Publish ingestion-complete event
+  Pub/Sub: ingestion-complete
+  {contract_id, revision, datastore_document_id, aura_node_count, status}
+  Subscribers: cache warmer, notification service, reconciliation tracker.
+
+HANDLING LEAP CONTRACT REVISIONS
+----------------------------------
+LEAP creates a new frozen document on each amendment. The same contract
+HC-2023-001 may have revisions 1, 2, 3 over time.
+
+In Vertex AI Data Store:
+  - Import with document_id = "{contract_id}_{revision}"
+  - Earlier revisions stay searchable for history/audit
+  - Default search filter: tag each document with is_latest=true/false
+    and filter on is_latest=true by default
+
+In Neo4j AuraDB:
+  - Contract nodes carry revision: (c:Contract {contract_id, revision})
+  - New revision ingestion writes a SUPERSEDES edge:
+      MERGE (new:Contract {contract_id: $id, revision: $new_rev})
+      MERGE (old:Contract {contract_id: $id, revision: $old_rev})
+      MERGE (new)-[:SUPERSEDES]->(old)
+  - Default queries filter to the latest revision:
+      MATCH (c:Contract {contract_id: $id})
+      WHERE NOT ()-[:SUPERSEDES]->(c)   ← nothing supersedes it = latest
+      RETURN c
+
+Chunk-level change detection (efficiency optimization for v2):
+  At ingestion time, hash each page's normalized text (SHA256).
+  Compare to hash from prior revision (stored in AuraDB or Firestore).
+  If hash matches: skip LLM extraction, reuse prior nodes/edges.
+  Only re-extract pages where the hash changed.
+  Benefit: for a 100-page contract with 3 changed pages, run LLM on 3 pages
+  instead of 100 — ~97% LLM cost saving per revision.
+
+Amendment ordering problem:
+  Pub/Sub does not guarantee message ordering. If an amendment arrives before
+  its master agreement is in AuraDB, the PARENT_OF edge cannot be written.
+  Fix: after writing the Contract node, check if parent_contract_id is set.
+  If the parent is not found in AuraDB, publish to Cloud Tasks with a 3-minute
+  delay. By then, the parent will have been written.
+
+INGESTION FLOW ASCII DIAGRAM
+------------------------------
+
+LEAP (contract frozen)
+       │
+       │  Workato recipe
+       ▼
+  GCS: gs://contracts-raw/{contract_id}/{revision}/contract.pdf
+       │
+       │  "object finalized" notification
+       ▼
+  Pub/Sub: contracts-landed
+       │
+       ▼
+  Cloud Workflows (orchestrator)
+       │
+       ├── validate metadata ──► if missing → dead-letter topic
+       │
+       ├──────────────────────────┐
+       │  PARALLEL                │
+       ▼                          ▼
+  [BRANCH A]                 [BRANCH B]
+  Vertex AI Data Store       Cloud Run: ingestion-service
+  Import API call                 │
+  (managed OCR, chunk,            ├─► Document AI (clean OCR)
+   embed, index)                  ├─► LLM (entity extraction)
+       │                          ├─► EntityResolver (dedup)
+       │                          └─► Neo4j AuraDB MERGE
+       │                               └─► returns: {aura_node_ids}
+  returns: {datastore_doc_id}
+       │                          │
+       └──────────┬───────────────┘
+                  │  JOIN (both must succeed)
+                  ▼
+             Firestore: contract_mappings
+             {contract_id_revision → datastore_doc_id + aura_node_ids}
+                  │
+                  ▼
+             Pub/Sub: ingestion-complete
+
+
+================================================================================
+PART 4: DATA FLOW 2 — RETRIEVAL (EXTERNAL SYSTEMS → QUERY API → BOTH STORES)
+================================================================================
+
+WHO THE CALLERS ARE
+---------------------
+
+  Type 1: Vertex AI Agent (the conversational copilot)
+    A Gemini-powered agent deployed for contract teams. Users talk in natural
+    language. The agent calls the Query API as a registered tool and maintains
+    conversation history across turns.
+
+  Type 2: Honeywell internal systems (service-to-service)
+    CLM tools, ERP systems, dashboards needing contract data.
+    Auth: IAM Workload Identity Federation (service account, no API keys).
+
+  Type 3: External partners or auditors
+    Via API Gateway: rate-limited, API-key authenticated.
+    Row-level security: filtered to contracts they are a named party to.
+
+  Type 4: BI / Analytics tools (Looker, BigQuery)
+    Not real-time queries. Nightly APOC export from AuraDB → GCS → BigQuery.
+    Looker connects to BigQuery. This path bypasses the Query API entirely.
+
+QUERY ROUTING LOGIC INSIDE THE QUERY API
+------------------------------------------
+
+Every POST /query request goes through this flow:
+
+  Step 1: Authenticate and authorize
+    Verify Bearer token (IAM) or API key (API Gateway).
+    Check caller's data access scope (which confidentiality tiers they can see).
+    Row-level security: external callers automatically get a filter applied —
+    they only see contracts where they are a named Party.
+
+  Step 2: Check Redis cache
+    Cache key: SHA256(template_name + sorted_slots) for structured queries,
+               SHA256(query_text) for semantic queries.
+    Cache hit → return immediately (log cache_hit=true, skip Steps 3–5).
+
+  Step 3: Classify query intent
+    LLM call (Gemini Flash, ~150ms):
+      Returns: {type, template_name, slots}
+    Fallback (if LLM unavailable — regex-based, no LLM needed):
+      Handles ~60% of real queries: contract number patterns, known party names,
+      keywords like "expir", "milestone", "value". See Part 8 for full list.
+
+  Step 4: Route based on intent type (run AuraDB + Data Store in parallel)
+
+    STRUCTURED_INTENT → AuraDB only
+      "What milestones are in contract HC-2023-001?"
+      Look up Cypher template → execute with slots → serialize result.
+
+    SEMANTIC_INTENT → Vertex AI Data Store only
+      "Find clauses similar to this indemnification language"
+      Call Data Store search API with raw query text → top-k chunks.
+
+    HYBRID (most common) → both in parallel
+      "Tell me about Boeing contracts that expire this year"
+      AuraDB: structured facts (contract IDs, parties, dates, amounts)
+      Data Store: relevant clause text
+      Firestore: link chunk document_ids to AuraDB node_ids
+      Merge: {structured_facts} + {clause_text} as unified LLM context.
+
+    GLOBAL / AGGREGATION → AuraDB precomputed summaries
+      "Which party has the most contracts?"
+      Read precomputed properties on Party nodes (updated nightly).
+      Sub-100ms, no aggregation at query time.
+
+    UNCLASSIFIED → Data Store only (fallback)
+      Log as "unclassified" with raw query (feeds weekly template growth job).
+      Note in response: "Based on text search only; structured data not used."
+
+  Step 5: Generate final answer
+    Feed merged context to Gemini Pro. System prompt instructs:
+      - Cite contract_id for every fact
+      - Use exact figures from structured data, not paraphrased numbers
+      - Say "I don't have that information" rather than hallucinating
+
+  Step 6: Write to Redis cache, emit structured log, return response
+
+  Response structure:
+    {
+      "answer": "Boeing has three milestones due in 2026...",
+      "sources": [
+        {"contract_id": "HC-2023-001", "party": "Boeing",
+         "expiry": "2026-09-01", "value_usd": 800000,
+         "evidence_chunk": "CDR milestone per Section 4.2..."}
+      ],
+      "intent": "hybrid",
+      "template_used": "milestones_for_contract",
+      "cache_hit": false,
+      "latency_ms": 480
+    }
+
+TARGET LATENCY BREAKDOWN (async parallel execution)
+-----------------------------------------------------
+  Gemini Flash classification:   ~150ms
+  AuraDB Cypher (warm cache):    ~80ms   ┐ parallel
+  Data Store search:             ~200ms  ┘
+  Firestore mapping lookup:      ~5ms
+  Gemini Pro answer generation:  ~400ms
+  Overhead (serialization, etc): ~50ms
+  TOTAL:                         ~480ms
+
+VERTEX AI AGENT INTEGRATION (THE CONVERSATIONAL COPILOT)
+----------------------------------------------------------
+The Agent sits ABOVE the Query API. It never touches AuraDB or Data Store
+directly — it calls the Query API as registered tools.
+
+Tool definitions for the Vertex AI Agent:
+
+  query_contracts(question: str)
+    "Answer any question about Honeywell contract data."
+    Action: POST /query {question}
+
+  get_contract_detail(contract_id: str)
+    "Return full structured details for a specific contract."
+    Action: GET /contract/{contract_id}
+
+  list_expiring_contracts(days: int)
+    "Return contracts expiring within N days."
+    Action: GET /expiring/{days}
+
+  compare_contracts(contract_id_a: str, contract_id_b: str)
+    "Compare two contracts on parties, value, milestones, standards."
+    Action: POST /compare
+
+  check_contract_status(contract_id: str)
+    "Is this contract searchable yet? Returns ingestion status."
+    Action: GET /contract/{contract_id}/status
+
+The Agent manages conversation history and multi-turn context. The Query API
+is stateless — each tool call is independent. The Agent injects prior context
+into the question text before calling the tool, so the Query API's classifier
+sees a fully self-contained question every time.
+
+RETRIEVAL FLOW ASCII DIAGRAM
+------------------------------
+
+  User (chat, dashboard, API, Vertex AI Agent)
+       │
+       ▼
+  Vertex AI Agent (optional conversational layer)
+  [decides which tool to call based on conversation]
+       │
+       ▼
+  API Gateway (rate limiting, API key auth for external callers)
+       │
+       ▼
+  Cloud Run: Query API
+  ┌───────────────────────────────────────────────┐
+  │  1. Auth + access scope                        │
+  │  2. Redis cache check                          │
+  │  3. Gemini Flash: classify intent + slots      │
+  │                                               │
+  │  4a. structured → AuraDB Cypher template      │
+  │  4b. semantic   → Data Store search           │
+  │  4c. hybrid     → both in parallel            │
+  │      + Firestore mapping lookup               │
+  │                                               │
+  │  5. Gemini Pro: generate answer               │
+  │  6. Cache write + structured log              │
+  └───────────────────────────────────────────────┘
+       │                    │
+       ▼                    ▼
+  Neo4j AuraDB         Vertex AI
+  (graph facts)        Data Store
+                       (clause text)
+       │                    │
+       └──────────┬─────────┘
+                  ▼
+           Firestore mapping
+           (chunk → node bridge)
+                  │
+                  ▼
+           Unified JSON response
+
+
+================================================================================
+PART 5: INGESTION PIPELINE — FLAWS IN THE INITIAL VERSION (ingest_to_neo4j.py)
+================================================================================
+
+These are concrete bugs and missing pieces in the first version of the script
+that would prevent it from working correctly in production.
+
+FLAW 1 (line 80–82): EntityResolver dies between ingestion runs
+  The registry is a plain Python dict in memory. Every restart starts empty.
+  Neo4j already has "Honeywell Aerospace" from yesterday. Today's run sees
+  "Honeywell International" fresh, finds no registry match, creates a second
+  Party node. The duplicate problem recurs across runs silently.
+  Fix: seed the registry from existing AuraDB nodes at startup (Part 6).
+
+FLAW 2 (line 381): Edge confidence always returns 0.85 — the gate is bypassed
+  confidence = float(edge.get("properties", {}).get("confidence", 0.85))
+  The extraction schemas never ask GPT to output a "confidence" field. So
+  this always returns the default 0.85. The POSSIBLE_* gate (0.75 threshold)
+  never triggers. Every edge is treated as equally confident regardless of
+  image quality or LLM certainty.
+  Fix: add confidence to the extraction schema (Part 7).
+
+FLAW 3 (lines 322–330): _infer_confidence ignores image quality
+  base = 0.70 if source == "photographed" else 0.90
+  has_props = bool(node.get("properties"))
+  A blurry photographed page and a crisp photographed page get the same 0.70.
+  Fix: add image_quality field to PER_IMAGE_SCHEMA and use it in scoring.
+
+FLAW 4 (lines 372–378): src_type / tgt_type defaults to "Unknown" for cross-page edges
+  src_type = next((n["type"] for n in page.get("nodes", [])
+                   if n.get("name") == raw_src), "Unknown")
+  If an edge references an entity on a different page, src_type = "Unknown".
+  Then: MATCH (a:Unknown {canonical_name: $src}) — Neo4j finds nothing.
+  Edge is silently never written. All cross-page relationship data is lost.
+  Fix: maintain a contract-level name→type map across all pages.
+
+FLAW 5 (line 304): Vector upsert is a stub — nothing reaches Vertex AI
+  log.debug("Would upsert vector chunk_id=%s neo4j_ids=%s", ...)
+  The datapoint dict is constructed but index.upsert_datapoints() is never
+  called. The vector store receives zero data. Vector search returns nothing.
+  Fix: wire the actual Vertex AI API call.
+
+FLAW 6 (line 58): BATCH_SIZE defined but never used
+  BATCH_SIZE = 50  # never referenced again
+  Every node and edge is written in its own Neo4j session + transaction.
+  For 200 pages × 20 nodes each = 4,000 separate transactions × ~5ms overhead
+  = 20 seconds of pure transaction overhead per contract.
+  Fix: accumulate nodes/edges and submit with UNWIND batch transactions.
+
+FLAW 7 (structural): No cross-run registry persistence
+  No mechanism to save resolved aliases (entity A = entity B) between runs.
+  Fix: after each run, dump registry to JSON or write SAME_AS edges to AuraDB.
+  On next run startup, load from that persisted state.
+
+FLAW 8 (lines 405–406): No retry queue for partial failures
+  except Exception as e:
+      log.error("Unexpected error on %s page %s: %s", ...)
+  If AuraDB write succeeds but vector upsert fails, just logs and continues.
+  No retry. Vector store silently falls behind. No way to know which pages
+  are missing from the vector index without a full reconciliation scan.
+  Fix: publish failed upserts to Cloud Pub/Sub dead-letter queue.
+  A Cloud Function subscriber retries with exponential backoff.
+
+FLAW 9 (lines 132–136): MetadataStore column detection is fragile
+  id_col = next(
+      (c for c in self._df.columns if "contract" in c.lower() and "id" in c.lower()),
+      self._df.columns[0],
+  )
+  If the CSV has multiple columns matching "contract" + "id", next() picks
+  the first one — silently. Falls back to column[0] with no warning.
+  Fix: require an explicit --id-column argument. Never silently guess a primary key.
+
+FLAW 10 (structural): No distributed tracing
+  No OpenTelemetry spans, no Cloud Trace. If ingestion is slow, you cannot
+  tell whether the bottleneck is entity resolution, AuraDB writes, or vector
+  API calls. Fix: add tracer spans around each step (Part 13).
+
+FLAW 11 (print_stats): Stats never reach Cloud Monitoring
+  def print_stats(self):
+      log.info("  %-40s %d", k, v)
+  Output goes to stdout only. No JSON fields, no metrics. You cannot alert
+  on "possible_edge_ratio > 30%" because the number only exists in a log line.
+  Fix: emit structured JSON logs with metric fields (Part 13).
+
+FLAW 12 (line 166): Connection pool not configured
+  self._driver = GraphDatabase.driver(uri, auth=(user, password))
+  Default pool settings are fine for development. For production with concurrent
+  ingestion and query traffic, configure explicitly:
+    GraphDatabase.driver(uri, auth=(user, password),
+        max_connection_pool_size=50,
+        connection_acquisition_timeout=10.0,
+        max_transaction_retry_time=30.0)
+
+
+================================================================================
+PART 6: ENTITY RESOLUTION — COMPLETE DESIGN
+================================================================================
+
+THE PROBLEM
+-----------
+The LLM extracts entity names independently on each page. The same company
+appears as "Honeywell", "Honeywell Aerospace", "Honeywell International Inc.",
+"HONEYWELL INC". Without resolution, Neo4j creates four separate Party nodes.
+Queries for "Honeywell" miss 3/4 of the real data — silently.
+
+THREE-LAYER RESOLUTION
+-----------------------
+
+Layer 1: Normalization (cheap, synchronous, zero DB calls)
+  - Lowercase
+  - Strip legal suffixes: Inc, LLC, Corp, International, Aerospace, Ltd, Group
+  - Remove punctuation, collapse whitespace
+  - "Honeywell International Inc." → "honeywell"
+
+Layer 2: In-process registry (during one ingestion run)
+  - Maintain {normalized_name → canonical_name} per node type
+  - On each new entity: check registry first
+  - Fuzzy match (SequenceMatcher) + substring containment check
+  - Threshold: >= 0.85 similarity → same entity, return existing canonical name
+  - aliases the new form in the registry so future lookups are O(1)
+
+Layer 3: MERGE semantics in AuraDB (across ingestion runs)
+  - Never use CREATE for nodes — always MERGE on canonical_name
+  - Re-ingesting a contract converges to the same node
+  - Properties updated with SET n += $props (latest wins)
+
+CROSS-RUN PERSISTENCE (fixing Flaw 1)
+---------------------------------------
+The in-process registry dies with the process. Fix: seed it at startup.
+
+  def seed_registry_from_auradb(self, driver):
+      with driver.session() as s:
+          result = s.run(
+              "MATCH (n) WHERE n.canonical_name IS NOT NULL "
+              "RETURN n.canonical_name AS name, labels(n)[0] AS label"
+          )
+          for record in result:
+              norm = self._normalize(record["name"])
+              self._registry[record["label"]][norm] = record["name"]
+      log.info("Seeded entity registry: %d existing nodes",
+               sum(len(v) for v in self._registry.values()))
+
+After each run, persist aliases as SAME_AS edges in AuraDB for audit:
+  MERGE (a {canonical_name: $canonical})
+  MERGE (b {canonical_name: $alias})
+  MERGE (a)-[:SAME_AS {resolved_by: 'entity_resolver', score: $score}]->(b)
+
+CROSS-PAGE TYPE TRACKING (fixing Flaw 4)
+------------------------------------------
+Maintain a contract-level name→type map that persists across all pages:
+
+  contract_type_map: dict[str, str] = {}   # lives for the duration of one contract
+
+  for page in pages:
+      # Register types from this page's nodes
+      for node in page.get("nodes", []):
+          contract_type_map[node["name"]] = node.get("type", "Unknown")
+
+      # When processing edges, look up type from contract_type_map:
+      src_type = contract_type_map.get(raw_src, "Unknown")
+      # If still Unknown, query AuraDB directly (cross-contract edge):
+      if src_type == "Unknown":
+          src_type = self._lookup_type_from_auradb(raw_src, driver) or "Unknown"
+
+GOVERNMENT ABBREVIATIONS (fuzzy matching alone won't solve these)
+-------------------------------------------------------------------
+"USAF" and "US Air Force" will not fuzzy-match at 0.85. Maintain a synonym table:
+
+  SYNONYMS = {
+      "USAF": "United States Air Force",
+      "DOD": "Department of Defense",
+      "NASA": "National Aeronautics and Space Administration",
+      "DCMA": "Defense Contract Management Agency",
+      "AFRL": "Air Force Research Laboratory",
+  }
+
+  def resolve(self, name: str, node_type: str) -> str:
+      canonical = SYNONYMS.get(name.upper(), name)  # check synonyms first
+      return self._fuzzy_resolve(canonical, node_type)
+
+ADVANCED OPTIONS
+-----------------
+  a) LLM-assisted resolution for borderline cases (score 0.70–0.84):
+     Ask the LLM: "Are 'Boeing Commercial' and 'Boeing Defense' the same entity?"
+     Only invoke for the grey zone — expensive but accurate.
+
+  b) Human review queue for borderline merges:
+     Log all resolutions with score 0.85–0.89 for human review.
+     Human confirms → keep merge. Human rejects → split:
+       MATCH (n:Party {canonical_name: $wrong_canonical})
+       MATCH (m:Party {canonical_name: $correct_name})
+       CALL apoc.refactor.mergeNodes([n, m], {properties: 'combine'})
+
+KEY METRICS FOR ENTITY RESOLUTION
+------------------------------------
+  entity_resolution_merge_rate = merges / (merges + new_entities)
+  Healthy:  30–60%  (many entities recur across contracts)
+  Too low:  < 5%    (OCR producing garbage names, normalization broken)
+  Too high: > 80%   (threshold too loose, unrelated entities being merged)
+
+AUDIT CYPHER QUERIES
+----------------------
+  // See all aliases resolved to canonical names
+  MATCH (n) WHERE exists(n.raw_name) AND n.raw_name <> n.canonical_name
+  RETURN n.type, n.canonical_name, collect(n.raw_name) AS aliases
+
+  // Find Party nodes that might still be duplicates post-ingestion
+  MATCH (a:Party), (b:Party)
+  WHERE a.canonical_name < b.canonical_name
+    AND apoc.text.sorensenDiceSimilarity(a.canonical_name, b.canonical_name) > 0.7
+  RETURN a.canonical_name, b.canonical_name
+
+
+================================================================================
+PART 7: EXTRACTION CONFIDENCE — SCORING, GATING, HUMAN REVIEW
+================================================================================
+
+WHY THIS MATTERS
+-----------------
+If low-confidence extractions write hard edges to AuraDB, the graph becomes
+polluted. Future queries return wrong results with no error message — just
+wrong answers. The graph silently lies.
+
+CONFIDENCE SCORING MODEL
+--------------------------
+score = base × quality_modifier × property_modifier × gpt_modifier
+        capped to [0.0, 1.0]
+
+  base_score:
+    "pdf_text"     (native PDF, machine-readable text): 0.90
+    "photographed" (image → GPT/Document AI vision):    0.70
+
+  quality_modifier (from image_quality field in extraction schema):
+    "clear":    × 1.00
+    "moderate": × 0.95
+    "poor":     × 0.80
+
+  property_modifier:
+    node has at least one non-empty property value: × 1.05
+    node has zero property values (name only):      × 0.95
+
+  gpt_modifier (from GPT self-assessment field, if added to schema):
+    gpt_confidence >= 0.8: × 1.05
+    gpt_confidence  < 0.6: × 0.85
+    otherwise:             × 1.00
+
+  Examples:
+    PDF text + has properties:                 0.90 × 1.00 × 1.05 = 0.945
+    Photographed + clear + has properties:     0.70 × 1.00 × 1.05 = 0.735
+    Photographed + moderate + no properties:   0.70 × 0.95 × 0.95 = 0.632
+    Photographed + poor + no properties:       0.70 × 0.80 × 0.95 = 0.532
+
+CONFIDENCE GATES
+-----------------
+  >= 0.85   → Hard edge, written as-is (PARTY_TO, HAS_MILESTONE, etc.)
+  0.75–0.84 → Hard edge + confidence stored as property on the edge
+  0.60–0.74 → POSSIBLE_{RELATION} (POSSIBLE_PARTY_TO, POSSIBLE_HAS_MILESTONE)
+              excluded from all default traversal queries
+  < 0.60    → Not written to AuraDB; published to review queue
+
+Default traversal queries automatically skip POSSIBLE_* edges:
+  MATCH (c:Contract)-[:PARTY_TO]->(p:Party)     ← never matches POSSIBLE_PARTY_TO
+
+Reviewers can query POSSIBLE_* explicitly:
+  MATCH (c:Contract)-[r]->(p)
+  WHERE type(r) STARTS WITH 'POSSIBLE_'
+  RETURN c.contract_id, type(r), p.canonical_name, r.confidence
+
+ADDING CONFIDENCE TO YOUR EXTRACTION SCHEMA
+---------------------------------------------
+In analyze_contracts.py — add to PER_IMAGE_SCHEMA:
+  "image_quality": {
+      "type": "string",
+      "enum": ["clear", "moderate", "poor"],
+      "description": "Your assessment of the image readability"
+  },
+  "extraction_confidence": {
+      "type": "number",
+      "description": "Your confidence (0.0-1.0) in the accuracy of all extracted fields"
+  }
+
+In graph_schema_extractor.py — add to SYSTEM_PROMPT:
+  "For every node you extract, add a 'gpt_confidence' field (0.0–1.0):
+   0.9+: clearly stated in text, unambiguous.
+   0.7–0.9: likely correct but could be misread.
+   0.5–0.7: uncertain — partial information.
+   <0.5: guessing — consider not extracting this at all."
+
+HUMAN REVIEW WORKFLOW
+-----------------------
+What goes into the review queue:
+  - Edges with confidence < 0.60 (not written to graph)
+  - POSSIBLE_* edges with confidence 0.60–0.74
+  - Entity resolution merges with score 0.85–0.89 (borderline merges)
+
+Implementation with Cloud Pub/Sub:
+  On low-confidence edge, publish to "contract-review-queue" topic:
+    {
+      "type": "low_confidence_edge",
+      "src_name": "Boeing Defense",
+      "relation": "PARTY_TO",
+      "tgt_name": "HC-2023-001",
+      "confidence": 0.58,
+      "evidence": "page text excerpt showing the mention",
+      "contract_id": "HC-2023-001",
+      "page": 7
+    }
+
+Review UI (Streamlit or Retool):
+  Shows: [Boeing Defense] --PARTY_TO--> [HC-2023-001] | Confidence: 0.58
+  Evidence: "...Boeing Defense Systems, as the primary contractor..."
+  Reviewer clicks: [APPROVE as hard edge] | [REJECT] | [SKIP]
+
+On approve → write hard edge to AuraDB:
+  MATCH (src:Party {canonical_name: 'Boeing Defense'})
+  MATCH (tgt:Contract {contract_id: 'HC-2023-001'})
+  MERGE (src)-[:PARTY_TO {confidence: 1.0, reviewed_by: $reviewer_id,
+                           review_date: $date}]->(tgt)
+
+On reject → delete POSSIBLE_* edge, log the false positive for model feedback.
+
+Tuning the threshold using review outcomes:
+  Track approval_rate by extraction_source and image_quality.
+  If approval_rate > 85%: threshold is too conservative → lower it.
+  If approval_rate < 40%: threshold is too loose → raise it.
+  Target: 70–85% approval rate on items entering the review queue.
+
+
+================================================================================
+PART 8: CYPHER TEMPLATE LIBRARY — ALL QUERY CATEGORIES
+================================================================================
+
+WHY TEMPLATES, NOT FREE-FORM CYPHER GENERATION
+------------------------------------------------
+Free-form: LLM reads the question → writes Cypher → execute.
+  Risk: wrong relationship direction, wrong property names, missing WHERE.
+  Fails silently (empty result) or throws. Cannot be unit tested.
+
+Template approach: LLM does only two things:
+  1. Intent classification: "which template does this question need?"
+  2. Slot extraction: "what are the parameter values?"
+  System fills the template. Cypher is NEVER generated at runtime.
+  Every template is pre-validated, has the right indexes, can be tested.
+
+THE CLASSIFICATION PROMPT
+---------------------------
+System prompt sent to Gemini Flash at query time:
+
+  "You are a query router for a Honeywell contract intelligence system.
+   Given a user question, output JSON with two fields:
+     - 'template': exactly one value from the list below
+     - 'slots': an object with the parameter values for that template
+
+   Templates and their slots:
+     contracts_by_party           → {party_name}
+     contract_by_id               → {contract_id}
+     party_profile                → {party_name}
+     milestones_for_contract      → {contract_id}
+     deliverables_for_contract    → {contract_id}
+     standards_for_contract       → {contract_id}
+     contracts_by_standard        → {standard_ref}
+     milestones_by_party_standard → {party_name, standard_ref}
+     shared_contracts             → {party_a, party_b}
+     contract_family              → {contract_id, depth (default 3)}
+     contract_ancestry            → {contract_id}
+     superseded_contracts         → {contract_id}
+     expiring_soon                → {days}
+     effective_in_period          → {start_date, end_date}
+     milestones_in_period         → {start_date, end_date}
+     high_value_contracts         → {amount_usd, limit (default 20)}
+     value_by_party               → {party_name}
+     value_by_sbg                 → {}
+     contracts_by_status          → {status, sbg (optional)}
+     contracts_by_type            → {document_type}
+     network_summary              → {limit (default 20)}
+     standard_frequency           → {limit (default 20)}
+     milestone_distribution       → {}
+     unclassified                 → {raw_query}
+
+   If the question fits no template, use 'unclassified'.
+   Return only valid JSON. No explanation."
+
+REGEX FALLBACK CLASSIFIER (no LLM required — handles ~60% of queries)
+  Contract number pattern [A-Z]{2}-\d{4}-\d{3} → contract_by_id
+  "Boeing"/"Raytheon"/"USAF" (known names)      → contracts_by_party
+  "expir" keyword                                → expiring_soon
+  "milestone" keyword                            → milestones_for_contract
+  "value"/"worth"/"$" keyword                    → high_value_contracts
+  No match                                       → LLM classifier
+
+
+CATEGORY A: ENTITY LOOKUP
+---------------------------
+Signal words: company names, "involving", "with", "by", contract numbers
+
+A1. contracts_by_party
+  Natural language: "Find all Boeing contracts", "What contracts involve Airbus?",
+                    "Show everything with the US Air Force"
+  Slots: party_name
+
+  MATCH (p:Party)<-[:PARTY_TO]-(c:Contract)
+  WHERE p.canonical_name =~ ('(?i).*' + $party_name + '.*')
+  RETURN c.contract_id, c.sales_contract_effective_date,
+         c.sales_contract_expiration_date, c.sales_contract_status,
+         c.sales_contract_or_amendment_value_usd, c.general_contract_sbgs
+  ORDER BY c.sales_contract_expiration_date
+  Index: CREATE INDEX party_canonical FOR (p:Party) ON (p.canonical_name)
+
+A2. contract_by_id
+  Natural language: "Pull up contract HC-2023-001", "Look up HC2022-094"
+  Slots: contract_id
+
+  MATCH (c:Contract)
+  WHERE c.contract_id = $contract_id OR c.contract_id CONTAINS $contract_id
+  OPTIONAL MATCH (c)-[:PARTY_TO]->(p:Party)
+  OPTIONAL MATCH (c)-[:HAS_MILESTONE]->(m:Milestone)
+  OPTIONAL MATCH (c)-[:REFERENCES_STANDARD]->(s:Standard)
+  OPTIONAL MATCH (c)-[:HAS_DELIVERABLE]->(d:Deliverable)
+  RETURN c,
+         collect(DISTINCT p.canonical_name) AS parties,
+         collect(DISTINCT {label: m.label, date: m.date, value: m.value}) AS milestones,
+         collect(DISTINCT s.name) AS standards,
+         collect(DISTINCT d.name) AS deliverables
+  Index: CREATE INDEX contract_id_idx FOR (c:Contract) ON (c.contract_id)
+
+A3. party_profile
+  Natural language: "Tell me everything about Boeing", "What's our relationship with Raytheon?"
+  Slots: party_name
+
+  MATCH (p:Party)
+  WHERE p.canonical_name =~ ('(?i).*' + $party_name + '.*')
+  MATCH (p)<-[:PARTY_TO]-(c:Contract)
+  OPTIONAL MATCH (c)-[:HAS_MILESTONE]->(m:Milestone)
+  RETURN p.canonical_name,
+         count(DISTINCT c) AS total_contracts,
+         sum(toFloat(c.sales_contract_or_amendment_value_usd)) AS total_value_usd,
+         collect(DISTINCT c.sales_contract_status) AS statuses,
+         collect(DISTINCT c.general_contract_sbgs) AS sbgs,
+         min(date(c.sales_contract_effective_date)) AS earliest_contract,
+         max(date(c.sales_contract_expiration_date)) AS latest_expiry
+
+
+CATEGORY B: RELATIONSHIP TRAVERSAL
+-------------------------------------
+Signal words: "milestones", "deliverables", "standards", "requirements", "sections"
+
+B1. milestones_for_contract
+  Natural language: "What milestones are in contract X?", "Show me the schedule for X"
+  Slots: contract_id
+
+  MATCH (c:Contract {contract_id: $contract_id})-[:HAS_MILESTONE]->(m:Milestone)
+  RETURN m.label, m.date, m.value, m._extraction_confidence AS confidence
+  ORDER BY m.date ASC
+
+B2. deliverables_for_contract
+  Natural language: "What are the deliverables for contract X?"
+  Slots: contract_id
+
+  MATCH (c:Contract {contract_id: $contract_id})-[:HAS_DELIVERABLE]->(d:Deliverable)
+  RETURN d.name, d.properties, d._extraction_confidence
+
+B3. standards_for_contract
+  Natural language: "Which FAR clauses does X reference?", "What standards apply?"
+  Slots: contract_id
+
+  MATCH (c:Contract {contract_id: $contract_id})-[:REFERENCES_STANDARD]->(s:Standard)
+  RETURN s.name, s.properties
+  ORDER BY s.name
+
+B4. contracts_by_standard
+  Natural language: "Which contracts reference FAR 52.219?", "Find all with DFARS 252.X"
+  Slots: standard_ref
+
+  MATCH (c:Contract)-[:REFERENCES_STANDARD]->(s:Standard)
+  WHERE s.name CONTAINS $standard_ref
+  RETURN c.contract_id, c.sales_contract_company_name,
+         c.sales_contract_status, s.name AS matched_standard
+  ORDER BY c.contract_id
+  Index: CREATE TEXT INDEX standard_name FOR (s:Standard) ON (s.name)
+
+
+CATEGORY C: MULTI-HOP / CROSS-ENTITY
+---------------------------------------
+Signal words: "AND", "both", "where X and Y", "that also", "referencing...AND"
+
+C1. milestones_by_party_and_standard
+  Natural language: "Milestones in Boeing contracts referencing FAR 52.219"
+  Slots: party_name, standard_ref
+
+  MATCH (p:Party)<-[:PARTY_TO]-(c:Contract)-[:REFERENCES_STANDARD]->(s:Standard)
+  WHERE p.canonical_name =~ ('(?i).*' + $party_name + '.*')
+    AND s.name CONTAINS $standard_ref
+  MATCH (c)-[:HAS_MILESTONE]->(m:Milestone)
+  RETURN c.contract_id, p.canonical_name, m.label, m.date, m.value, s.name
+
+C2. shared_contracts
+  Natural language: "Find contracts where Boeing and Honeywell are both involved"
+  Slots: party_a, party_b
+
+  MATCH (pa:Party)<-[:PARTY_TO]-(c:Contract)-[:PARTY_TO]->(pb:Party)
+  WHERE pa.canonical_name =~ ('(?i).*' + $party_a + '.*')
+    AND pb.canonical_name =~ ('(?i).*' + $party_b + '.*')
+  RETURN c.contract_id, pa.canonical_name, pb.canonical_name,
+         c.sales_contract_status, c.sales_contract_or_amendment_value_usd
+
+C3. active_expiring_for_party
+  Natural language: "Boeing contracts expiring in the next 90 days"
+  Slots: party_name, days
+
+  MATCH (p:Party)<-[:PARTY_TO]-(c:Contract)
+  WHERE p.canonical_name =~ ('(?i).*' + $party_name + '.*')
+    AND c.sales_contract_status = 'Active'
+    AND date(c.sales_contract_expiration_date) >= date()
+    AND date(c.sales_contract_expiration_date) <= date() + duration({days: $days})
+  RETURN c.contract_id, c.sales_contract_expiration_date,
+         duration.between(date(), date(c.sales_contract_expiration_date)).days AS days_remaining
+  ORDER BY c.sales_contract_expiration_date
+
+C4. cross_document_references
+  Natural language: "What does contract X reference?", "Which contracts link to X?"
+  Slots: contract_id
+
+  MATCH (c:Contract {contract_id: $contract_id})
+  OPTIONAL MATCH (c)-[:RELATED_TO]->(linked1)
+  OPTIONAL MATCH (c)-[:SUPERSEDES]->(linked2)
+  OPTIONAL MATCH (c)<-[:PARENT_OF]-(parent)
+  RETURN c.contract_id,
+         collect(DISTINCT linked1.contract_id) AS related_to,
+         collect(DISTINCT linked2.contract_id) AS supersedes,
+         collect(DISTINCT parent.contract_id) AS parents
+
+
+CATEGORY D: CONTRACT LINEAGE
+------------------------------
+Signal words: "parent", "child", "supersede", "replace", "legacy", "family",
+              "version", "amendment", "master agreement"
+
+D1. contract_family
+  Natural language: "Show the contract family of HC-2019-001", "All amendments under X"
+  Slots: contract_id, depth (default 3)
+
+  MATCH path = (root:Contract {contract_id: $contract_id})
+               -[:PARENT_OF|SUPERSEDES*1..$depth]->(descendant)
+  RETURN [n IN nodes(path) | n.contract_id] AS lineage_chain,
+         length(path) AS depth,
+         last(nodes(path)).sales_contract_status AS leaf_status
+
+D2. contract_ancestry
+  Natural language: "What is the parent contract of X?", "Find the master agreement for X"
+  Slots: contract_id
+
+  MATCH path = (child:Contract {contract_id: $contract_id})
+               <-[:PARENT_OF*1..5]-(ancestor)
+  RETURN [n IN nodes(path) | n.contract_id] AS ancestry_chain,
+         length(path) AS levels_up
+
+D3. superseded_contracts
+  Natural language: "What did HC-2023-001 replace?", "Find the legacy version"
+  Slots: contract_id
+
+  MATCH (c:Contract {contract_id: $contract_id})-[:SUPERSEDES]->(old)
+  RETURN old.contract_id, old.sales_contract_status,
+         old.sales_contract_expiration_date, old.sales_contract_or_amendment_value_usd
+
+
+CATEGORY E: TIME-BASED
+------------------------
+Signal words: "expiring", "due", "next", "between", "Q1", "quarter", "year",
+              "before", "after", "renewal"
+
+E1. expiring_soon
+  Natural language: "Contracts expiring in the next 90 days", "What's up for renewal?"
+  Slots: days
+
+  MATCH (c:Contract)
+  WHERE c.sales_contract_status = 'Active'
+    AND date(c.sales_contract_expiration_date) >= date()
+    AND date(c.sales_contract_expiration_date) <= date() + duration({days: $days})
+  OPTIONAL MATCH (c)-[:PARTY_TO]->(p:Party)
+  RETURN c.contract_id, p.canonical_name AS party,
+         c.sales_contract_expiration_date,
+         duration.between(date(), date(c.sales_contract_expiration_date)).days AS days_remaining,
+         c.sales_contract_or_amendment_value_usd
+  ORDER BY c.sales_contract_expiration_date
+  Index: CREATE INDEX contract_status_expiry FOR (c:Contract)
+         ON (c.sales_contract_status, c.sales_contract_expiration_date)
+
+E2. effective_in_period
+  Natural language: "Contracts that went active between Jan 2022 and Dec 2023"
+  Slots: start_date, end_date (ISO format "2022-01-01")
+
+  MATCH (c:Contract)
+  WHERE date(c.sales_contract_effective_date) >= date($start_date)
+    AND date(c.sales_contract_effective_date) <= date($end_date)
+  RETURN c.contract_id, c.sales_contract_effective_date,
+         c.sales_contract_company_name, c.sales_contract_or_amendment_value_usd
+  ORDER BY c.sales_contract_effective_date
+
+E3. milestones_in_period
+  Natural language: "Milestones due next quarter", "All PDRs and CDRs in H1 2026"
+  Slots: start_date, end_date
+
+  MATCH (c:Contract)-[:HAS_MILESTONE]->(m:Milestone)
+  WHERE date(m.date) >= date($start_date)
+    AND date(m.date) <= date($end_date)
+  OPTIONAL MATCH (c)-[:PARTY_TO]->(p:Party)
+  RETURN c.contract_id, p.canonical_name AS party, m.label, m.date, m.value
+  ORDER BY m.date
+
+
+CATEGORY F: FINANCIAL
+-----------------------
+Signal words: "worth", "value", "cost", "$", "million", "budget",
+              "highest", "lowest", "total", "sum", "breakdown"
+
+F1. high_value_contracts
+  Natural language: "Contracts worth more than $5M", "Top 20 by value"
+  Slots: amount_usd, limit (default 20)
+
+  MATCH (c:Contract)
+  WHERE toFloat(c.sales_contract_or_amendment_value_usd) > $amount_usd
+  OPTIONAL MATCH (c)-[:PARTY_TO]->(p:Party)
+  RETURN c.contract_id, p.canonical_name AS party,
+         toFloat(c.sales_contract_or_amendment_value_usd) AS value_usd,
+         c.sales_contract_status, c.sales_contract_expiration_date
+  ORDER BY value_usd DESC
+  LIMIT $limit
+
+F2. value_by_party
+  Natural language: "Total contract value with Boeing", "How much do we do with Raytheon?"
+  Slots: party_name
+
+  MATCH (p:Party)<-[:PARTY_TO]-(c:Contract)
+  WHERE p.canonical_name =~ ('(?i).*' + $party_name + '.*')
+  RETURN p.canonical_name,
+         count(DISTINCT c) AS contract_count,
+         sum(toFloat(c.sales_contract_or_amendment_value_usd)) AS total_value_usd,
+         avg(toFloat(c.sales_contract_or_amendment_value_usd)) AS avg_value_usd
+
+F3. value_by_sbg
+  Natural language: "Break down contract value by business group"
+  Slots: (none)
+
+  MATCH (c:Contract)
+  WHERE c.general_contract_sbgs IS NOT NULL
+  RETURN c.general_contract_sbgs AS sbg,
+         count(c) AS contract_count,
+         sum(toFloat(c.sales_contract_or_amendment_value_usd)) AS total_value_usd
+  ORDER BY total_value_usd DESC
+
+
+CATEGORY G: STATUS / CLASSIFICATION
+--------------------------------------
+Signal words: "active", "expired", "terminated", "government", "type",
+              "confidential", "status", "SBG", "SBU", "SBE"
+
+G1. contracts_by_status
+  Natural language: "Show all active contracts", "List expired contracts for SBG Aero"
+  Slots: status, sbg (optional)
+
+  MATCH (c:Contract)
+  WHERE c.sales_contract_status = $status
+    AND ($sbg IS NULL OR c.general_contract_sbgs CONTAINS $sbg)
+  OPTIONAL MATCH (c)-[:PARTY_TO]->(p:Party)
+  RETURN c.contract_id, p.canonical_name AS party,
+         c.sales_contract_expiration_date, c.sales_contract_or_amendment_value_usd
+  ORDER BY c.sales_contract_expiration_date
+
+G2. contracts_by_type
+  Natural language: "Show all government solicitation contracts", "List all SOWs"
+  Slots: document_type
+
+  MATCH (c:Contract)
+  WHERE c.document_type = $document_type OR c.sales_contract_type = $document_type
+  RETURN c.contract_id, c.sales_contract_company_name, c.sales_contract_status
+
+G3. confidential_contracts
+  Natural language: "Which contracts are marked confidential?"
+  Slots: (none)
+
+  MATCH (c:Contract)
+  WHERE c.general_contract_confidential = 'true'
+     OR c.sales_contract_is_confidential = 'true'
+  RETURN c.contract_id, c.sales_contract_company_name, c.sales_contract_status
+
+
+CATEGORY H: GLOBAL / AGGREGATION
+-----------------------------------
+Signal words: "most common", "all", "across all", "how many", "breakdown",
+              "overview", "summary", "which...most", "pattern"
+NOTE: this is the "global mode" of Graph RAG — requires seeing the whole graph.
+
+H1. network_summary
+  Natural language: "Who are our biggest partners?", "Contract count per party"
+  Slots: limit (default 20)
+
+  MATCH (p:Party)<-[:PARTY_TO]-(c:Contract)
+  RETURN p.canonical_name,
+         count(DISTINCT c) AS contract_count,
+         sum(toFloat(c.sales_contract_or_amendment_value_usd)) AS total_value_usd
+  ORDER BY contract_count DESC
+  LIMIT $limit
+
+H2. standard_frequency
+  Natural language: "Most referenced standards", "Which FAR clauses appear most?"
+  Slots: limit (default 20)
+
+  MATCH (c:Contract)-[:REFERENCES_STANDARD]->(s:Standard)
+  RETURN s.name,
+         count(DISTINCT c) AS used_in_contracts,
+         collect(DISTINCT c.general_contract_sbgs)[..5] AS sample_sbgs
+  ORDER BY used_in_contracts DESC
+  LIMIT $limit
+
+H3. milestone_distribution
+  Natural language: "Most common milestone types", "Typical milestone schedule"
+  Slots: (none)
+
+  MATCH (c:Contract)-[:HAS_MILESTONE]->(m:Milestone)
+  RETURN m.label, count(*) AS frequency,
+         avg(toFloat(m.value)) AS avg_value_usd,
+         min(m.date) AS earliest, max(m.date) AS latest
+  ORDER BY frequency DESC
+
+
+LOGGING UNCLASSIFIED QUERIES
+------------------------------
+When the classifier returns "unclassified":
+
+  from google.cloud import logging as gcp_logging
+  gcp_logger = gcp_logging.Client().logger("contract-query-unclassified")
+
+  def handle_unclassified_query(raw_query: str, user_id: str):
+      gcp_logger.log_struct({
+          "raw_query": raw_query,
+          "query_hash": hashlib.md5(raw_query.lower().strip().encode()).hexdigest(),
+          "user_id": user_id,
+          "timestamp": datetime.utcnow().isoformat(),
+          "template": "unclassified",
+      })
+      # Fall back to Data Store semantic search only
+      vector_results = datastore_search(raw_query, top_k=5)
+      return generate_answer_from_chunks(raw_query, vector_results,
+          note="This answer is based on text search only.")
+
+  In Cloud Monitoring: create a log-based metric on
+  jsonPayload.template = "unclassified" → counter metric: unclassified_query_count
+  Alert if this exceeds 5% of total queries.
+
+GROWING THE TEMPLATE LIBRARY FROM LOGS
+-----------------------------------------
+Weekly process:
+
+  Step 1: Pull all unclassified queries from Cloud Logging (last 7 days)
+    gcloud logging read 'jsonPayload.template="unclassified"' \
+      --freshness=7d --format=json > unclassified_queries.json
+
+  Step 2: Cluster by semantic similarity
+    - Embed each raw_query using text-embedding-005
+    - Run k-means clustering (k=5–10) on embeddings
+    - Each cluster = one candidate query pattern
+
+  Step 3: Review clusters
+    Cluster example (8 queries):
+      "Is AeroTech a sub on any contracts?"
+      "Which contracts use AeroTech as a subcontractor?"
+      "Find AeroTech subcontractor agreements"
+    → Pattern: "Find contracts where {party} has role 'subcontractor'"
+    → New template: contracts_by_party_role
+
+  Step 4: Write and validate the Cypher
+    MATCH (p:Party)<-[r:PARTY_TO]-(c:Contract)
+    WHERE p.canonical_name =~ ('(?i).*' + $party_name + '.*')
+      AND r.role = $role
+    RETURN c.contract_id, c.sales_contract_status
+    Test in Neo4j Browser. Add indexes. Run EXPLAIN.
+
+  Step 5: Add to registry + classification prompt + unit tests
+    Write 5 test cases before shipping.
+
+  Governance rule: never add a template for a pattern with fewer than 5
+  occurrences. Low-frequency queries stay as vector-search fallbacks.
+
+
+================================================================================
+PART 9: CACHING — FOUR-LAYER IMPLEMENTATION
+================================================================================
+
+TARGET LATENCIES
+-----------------
+  Vertex AI Data Store search:        ~200ms
+  Gemini Flash classification:        ~150ms (cacheable by query hash)
+  AuraDB Cypher (warm page cache):    ~80ms
+  Gemini Pro answer generation:       ~400ms
+  TOTAL end-to-end:                   ~480ms (acceptable for contract search)
+
+LAYER 1: NEO4J / AURADB PAGE CACHE (ZERO CODE — JUST CONFIG)
+--------------------------------------------------------------
+AuraDB manages this automatically on Enterprise tier. On self-hosted Neo4j,
+configure in neo4j.conf:
+  server.memory.pagecache.size=8g        (50–70% of available RAM)
+  server.memory.heap.initial_size=2g
+  server.memory.heap.max_size=4g
+
+How it works: graph pages accessed frequently stay in RAM. Repeated traversals
+on hot nodes never hit disk. First query after restart is slow; subsequent are fast.
+Target: page cache hit ratio > 95%. Check with:
+  CALL dbms.queryJmx("org.neo4j:instance=kernel#0,name=Page cache")
+  YIELD attributes RETURN attributes["Hit Ratio"].value
+
+LAYER 2: REDIS / CLOUD MEMORYSTORE (APPLICATION QUERY CACHE)
+--------------------------------------------------------------
+Cache the RESULT of executing a Cypher template. Key = hash of
+(template_name + sorted slots). TTL is dynamic based on freshness.
+
+  import redis, hashlib, json
+  from datetime import datetime
+
+  redis_client = redis.Redis(host=os.environ["REDIS_HOST"], port=6379,
+                             decode_responses=True)
+
+  def cache_key(template_name: str, slots: dict) -> str:
+      payload = template_name + json.dumps(slots, sort_keys=True)
+      return "cq:" + hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+  def ttl_for_result(result: list[dict]) -> int:
+      # TTL based on age of the most recently ingested contract in the result
+      now = datetime.utcnow()
+      most_recent = max(
+          (datetime.fromisoformat(r["_last_ingested"])
+           for r in result if r.get("_last_ingested")),
+          default=None
+      )
+      if most_recent is None:             return 3600    # default: 1h
+      age_h = (now - most_recent).total_seconds() / 3600
+      if age_h < 1:                       return 300     # very fresh: 5 min
+      elif age_h < 24:                    return 1800    # recent: 30 min
+      elif age_h < 168:                   return 7200    # week: 2h
+      else:                               return 86400   # older: 24h
+
+  def execute_template(template_name: str, slots: dict, driver) -> list[dict]:
+      NO_CACHE = {"expiring_soon", "milestones_in_period",
+                  "recently_modified_contracts", "possible_edge_review"}
+      if template_name in NO_CACHE:
+          return _run_cypher(template_name, slots, driver)
+
+      key = cache_key(template_name, slots)
+      cached = redis_client.get(key)
+      if cached:
+          return json.loads(cached)
+
+      result = _run_cypher(template_name, slots, driver)
+      redis_client.setex(key, ttl_for_result(result), json.dumps(result))
+      _register_cache_entry(key, result)   # for invalidation
+      return result
+
+Cache invalidation on re-ingestion:
+  def _register_cache_entry(key: str, result: list[dict]):
+      for row in result:
+          cid = row.get("contract_id")
+          if cid:
+              redis_client.sadd(f"cq:contract:{cid}", key)
+              redis_client.expire(f"cq:contract:{cid}", 86400)
+
+  def invalidate_contract(contract_id: str):
+      keys = redis_client.smembers(f"cq:contract:{contract_id}")
+      if keys:
+          redis_client.delete(*keys)
+          redis_client.delete(f"cq:contract:{contract_id}")
+
+LAYER 3: PRECOMPUTED SUMMARIES IN NEO4J (NIGHTLY BATCH)
+---------------------------------------------------------
+For frequent aggregation queries, compute and store results as properties.
+Queries read precomputed values instead of running expensive aggregations.
+
+Party profile summary (run nightly via Cloud Scheduler → Cloud Run):
+  MATCH (p:Party)<-[:PARTY_TO]-(c:Contract)
+  WITH p, count(DISTINCT c) AS cnt,
+       sum(toFloat(c.sales_contract_or_amendment_value_usd)) AS total
+  SET p.precomputed_contract_count = cnt,
+      p.precomputed_total_value_usd = total,
+      p.precomputed_at = toString(datetime())
+
+Query using precomputed values (sub-10ms, no aggregation):
+  MATCH (p:Party)
+  WHERE p.canonical_name =~ ('(?i).*' + $party_name + '.*')
+  RETURN p.canonical_name, p.precomputed_contract_count,
+         p.precomputed_total_value_usd
+
+LAYER 4: VECTOR SEARCH RESULT CACHE
+--------------------------------------
+Cache top-k Data Store results keyed by query text hash. TTL: 1 hour.
+
+  def cached_datastore_search(query_text: str, top_k: int = 5) -> list[dict]:
+      key = "vs:" + hashlib.sha256(query_text.lower().strip().encode()).hexdigest()[:16]
+      cached = redis_client.get(key)
+      if cached:
+          return json.loads(cached)
+      results = datastore_client.search(query_text, num_results=top_k)
+      serialized = [{"id": r.id, "content": r.content, "score": r.relevance_score}
+                    for r in results]
+      redis_client.setex(key, 3600, json.dumps(serialized))
+      return serialized
+
+WHAT NEVER TO CACHE
+---------------------
+  - Time-relative queries ("expiring in the next 30 days") — answer changes daily
+  - POSSIBLE_* edge review queries — must always be fresh
+  - Any query where the contract was ingested in the last 60 seconds
+  - Queries filtered by caller identity (each user's row-level security differs)
+
+
+================================================================================
+PART 10: KEEPING TWO SYSTEMS IN SYNC
+================================================================================
+
+THE SYNC PROBLEM
+-----------------
+Vertex AI Data Store and Neo4j AuraDB are two separate systems. There is no
+distributed transaction across them. If one succeeds and the other fails,
+the stores drift apart silently. Vector search returns results that have
+no graph node. Graph queries return contracts with no associated text chunks.
+
+WHY GRAPH FIRST, THEN VECTOR
+------------------------------
+
+Reason 1: Stable entity identity is created by the graph, not the text
+  AuraDB's MERGE + EntityResolver creates a stable, deduplicated element_id.
+  The vector store must reference this stable ID in its metadata (the bridge).
+  If you embed first, entity resolution hasn't happened yet — you embed
+  "Honeywell" and "Honeywell Aerospace" as two separate vectors. Later, when
+  the graph resolves them to one node, you have two floating embeddings
+  pointing to the same graph node with no way to clean it up.
+
+Reason 2: The bridge must be created at write time, not retroactively
+  The neo4j_element_ids field in vector metadata is what lets you go from
+  "this chunk matched" → "these are the graph nodes to traverse."
+  If you embed first, element_ids don't exist yet. You'd need a second pass
+  to update metadata — two passes per contract, with a gap where the bridge
+  is broken and queries silently miss graph context.
+
+Reason 3: Metadata enriches the vector embedding
+  Structured metadata (contract_id, parties, SBG) comes from the graph write
+  step. Embedding first means this metadata isn't available to attach yet.
+
+Reason 4: Graph write is the harder problem
+  Graph writes can fail due to entity resolution or schema issues. Catch those
+  first before incurring vector embedding API costs (charged per call).
+
+Analogy: library system.
+  The catalog (graph) assigns the ISBN (stable ID), handles duplicate editions
+  (entity resolution), links related books. The full-text index (vector) points
+  back to catalog entries by ISBN. Build the catalog first.
+
+THE FIRESTORE MAPPING TABLE (the most critical piece)
+------------------------------------------------------
+Vertex AI Data Store's chunk IDs are opaque — they don't carry AuraDB node IDs.
+Firestore holds the link: {datastore_document_id → aura_node_ids}.
+
+At query time:
+  1. Data Store returns chunks with document_ids
+  2. Look up Firestore: document_id → aura_node_ids
+  3. Query AuraDB starting from those node IDs
+  4. Merge structured facts + chunk text → LLM context
+
+Five requirements for this table:
+  1. Transactional write: only write when BOTH ingestion branches confirm success.
+  2. Versioned entries: "{contract_id}_{revision}" as document ID. Never overwrite.
+  3. Coverage monitoring: daily job checks every Data Store document has a mapping
+     AND every AuraDB Contract has a mapping. Alert on any gap.
+  4. Immutable once written: Firestore security rules deny overwrites.
+  5. Cached at query time: Redis TTL 24h — Firestore lookup is 5ms but at
+     100+ QPS, caching saves meaningful latency.
+
+Firestore data model:
+  Collection: contract_mappings
+  Document ID: "{contract_id}_{revision}"
+  Fields:
+    contract_id, revision,
+    datastore_document_id, aura_node_ids (list of element_ids),
+    status ("complete" | "partial_ds_only" | "partial_neo4j_only"),
+    ingested_at, ingestion_run_id
+
+HANDLING PARTIAL FAILURES
+--------------------------
+  Case A: AuraDB write succeeds, Data Store import fails
+    Cloud Workflows retries Branch A up to 3 times.
+    If all retries fail: set Firestore status = "partial_neo4j_only".
+    Alert to operations. Run Branch A manually after fixing the issue.
+
+  Case B: Data Store import succeeds, AuraDB ingestion fails
+    Cloud Workflows retries Branch B up to 3 times.
+    If all retries fail: set Firestore status = "partial_ds_only".
+    Publish to contracts-failed Pub/Sub. Cloud Tasks retries AuraDB ingestion.
+
+  Case C: Contract deleted from both stores
+    DELETE from AuraDB: MATCH (c:Contract {contract_id: $id}) DETACH DELETE c
+    DELETE from Data Store: call documents.delete API
+    DELETE from Firestore: delete the mapping document
+    All three in the same pipeline function.
+
+WEEKLY RECONCILIATION JOB
+--------------------------
+  1. Pull all contract_id + revision from AuraDB:
+       MATCH (c:Contract) RETURN c.contract_id, c.revision
+  2. Pull all document_ids from Vertex AI Data Store (list documents API)
+  3. Query Firestore for all entries in contract_mappings
+  4. Diff: in AuraDB but not mapping → re-trigger Data Store import
+           in Data Store but not mapping → investigate (orphan document)
+           mapping exists but AuraDB node_ids broken → re-ingest contract
+  5. Log gaps as reconciliation_gap metric → alert if count > 0
+
+
+================================================================================
+PART 11: ORCHESTRATION — CLOUD WORKFLOWS, QUERY API, VERTEX AI AGENT
+================================================================================
+
+INGESTION: CLOUD WORKFLOWS (NOT CLOUD COMPOSER)
+-------------------------------------------------
+Cloud Composer (managed Airflow) is overkill for this use case. It requires:
+  - A dedicated GKE cluster (~$200+/month always-on infrastructure)
+  - DAG authoring in Python files
+  - Several minutes to deploy a DAG update
+  It is designed for complex ML pipelines with dozens of interdependent steps.
+
+Cloud Workflows is the right tool:
+  - Serverless: zero infrastructure, zero cost when idle
+  - Purpose-built for orchestrating HTTP API calls
+  - Supports parallel branches, retry with backoff, conditional logic
+  - Visual execution history in GCP Console per workflow run
+  - Cost: ~$0.01 per 1,000 internal steps (effectively free)
+
+Cloud Workflows handles:
+  - Parallel execution of Branch A and Branch B
+  - Waiting for both before writing Firestore
+  - Retry with exponential backoff on each branch independently
+  - Dead-letter routing when all retries are exhausted
+  - Execution history (every step, input/output, timestamp)
+
+Cloud Workflows does NOT handle (stays in Cloud Run):
+  - The actual LLM extraction logic
+  - Entity resolution
+  - AuraDB MERGE calls
+  These are too complex for a workflow definition; they live in the
+  Cloud Run ingestion service.
+
+SIMPLIFIED CLOUD WORKFLOWS YAML:
+
+  main:
+    params: [args]
+    steps:
+      - validate_metadata:
+          condition: ${args.contract_id != null}
+          next: parallel_ingest
+          else: dead_letter
+
+      - parallel_ingest:
+          parallel:
+            branches:
+              - branch_a:
+                  steps:
+                    - import_datastore:
+                        call: http.post
+                        args:
+                          url: ${DATASTORE_IMPORT_URL}
+                          auth: {type: OAuth2}
+                          body: {gcsUri: ${args.gcs_uri}}
+                        result: ds_result
+              - branch_b:
+                  steps:
+                    - ingest_neo4j:
+                        call: http.post
+                        args:
+                          url: https://ingestion-service.run.app/ingest
+                          auth: {type: OIDC}
+                          body: ${args}
+                        result: neo4j_result
+
+      - write_mapping:
+          call: http.post
+          args:
+            url: https://mapping-service.run.app/register
+            body:
+              contract_id: ${args.contract_id}
+              revision: ${args.revision}
+              datastore_doc_id: ${ds_result.body.documentId}
+              aura_node_ids: ${neo4j_result.body.node_ids}
+
+      - publish_complete:
+          call: googleapis.pubsub.v1.projects.topics.publish
+          args:
+            topic: ${COMPLETION_TOPIC}
+            body:
+              messages:
+                - data: ${base64.encode(json.encode(args))}
+
+      - dead_letter:
+          call: googleapis.pubsub.v1.projects.topics.publish
+          args:
+            topic: ${DEAD_LETTER_TOPIC}
+            body:
+              messages:
+                - data: ${base64.encode(json.encode({error: "missing_metadata"}))}
+
+RETRIEVAL: THE QUERY API IS THE ORCHESTRATOR
+---------------------------------------------
+No separate orchestration service is needed at query time. The Query API
+(FastAPI on Cloud Run) orchestrates everything in-process:
+  - Classifies intent (Gemini Flash call)
+  - Runs AuraDB + Data Store in parallel (asyncio.gather)
+  - Looks up Firestore mapping
+  - Merges results
+  - Generates answer (Gemini Pro call)
+  - Returns response
+
+Total: ~480ms. Introducing an external orchestration service here would
+add latency and complexity with no benefit.
+
+Async implementation:
+  async def handle_query(question: str) -> dict:
+      intent = await classify_intent(question)          # 150ms
+      ds_task   = asyncio.create_task(search_datastore(question))    # parallel
+      neo4j_task = asyncio.create_task(query_auradb(intent))         # parallel
+      ds_results, neo4j_results = await asyncio.gather(ds_task, neo4j_task)
+      context   = merge_results(ds_results, neo4j_results)           # 5ms
+      answer    = await generate_answer(question, context)            # 400ms
+      return build_response(answer, context)
+
+VERTEX AI AGENT: THE CONVERSATIONAL ORCHESTRATOR
+--------------------------------------------------
+For end-user chat interfaces, the Vertex AI Agent (Gemini) sits above the
+Query API. It is the outer orchestrator — it decides which tool to call and
+in what sequence based on the conversation. The Query API never needs to know
+about the agent or the conversation history.
+
+The Agent handles:
+  - Multi-turn conversation history
+  - Deciding which tool(s) to call
+  - Combining responses from multiple tool calls
+  - Formatting the final answer for the user
+
+The Query API handles:
+  - Authentication and access control
+  - Query classification and routing
+  - Data retrieval from both stores
+  - Structured response formatting
+
+This separation means: upgrade the Agent model without touching the Query API,
+or update the Query API internals without changing the Agent tool definitions.
+
+Tool definitions registered with the Vertex AI Agent:
+  query_contracts(question: str)      → POST /query
+  get_contract_detail(contract_id)    → GET /contract/{id}
+  list_expiring_contracts(days: int)  → GET /expiring/{days}
+  compare_contracts(id_a, id_b)       → POST /compare
+  check_contract_status(contract_id)  → GET /contract/{id}/status
+
+
+================================================================================
+PART 12: SHORTCOMINGS — INGESTION AND RETRIEVAL
+================================================================================
+
+INGESTION SHORTCOMINGS
+-----------------------
+
+1. Vertex AI Data Store chunking is a black box
+   You cannot control chunk size, chunk overlap, or section boundaries.
+   A critical clause may split across two chunks, weakening retrieval.
+   Mitigation: enable "extractive segments" (uses document structure).
+   Long-term: build a custom chunking pipeline if quality is consistently poor.
+
+2. Data Store indexing lag (2–10 minutes)
+   After import, the document is NOT immediately searchable.
+   Mitigation: expose GET /contract/{id}/status → {"datastore": "indexing"}.
+   Callers can poll before querying. This is a known Data Store limitation.
+
+3. No atomic cross-store write
+   AuraDB and Data Store have no distributed transaction. Branch A can succeed
+   and Branch B fail. The contract is half-searchable with no error raised.
+   Mitigation: Cloud Workflows retry + Firestore status field + daily reconciliation.
+
+4. Amendment ordering — amendments before master agreements
+   Pub/Sub doesn't guarantee message ordering. An amendment may arrive before
+   its master agreement is in AuraDB. The PARENT_OF edge can't be written.
+   Mitigation: use Cloud Tasks with a 3-minute delay for PARENT_OF edge writes.
+
+5. AuraDB connection cold-start from Cloud Run
+   Serverless Cloud Run instances scale to zero. First request after idle:
+   ~500ms to start the container + ~300ms to establish Bolt connection = ~800ms penalty.
+   Mitigation: set min_instances=1 on the ingestion Cloud Run service (~$15–20/month).
+
+6. LLM extraction errors are silent
+   If the LLM returns empty nodes or wrong entities, the pipeline writes nothing
+   or writes incorrect data. No error. The contract is "ingested" but the graph
+   is wrong. Mitigation: validate extraction output: node count > 0 for pages
+   with text, at least one Contract node per document. Flag as "needs_review" in
+   Firestore and alert operations if validation fails.
+
+7. Document AI quota for large backfills
+   Default quota: ~15 pages/minute for some processors. For historical backfills
+   of millions of pages, request quota increase in advance via GCP Console.
+   Cost: ~$0.0015/page standard OCR (~$15/month at 10,000 pages).
+
+8. Workato metadata gaps
+   If Workato doesn't populate contract_id or revision on the GCS object metadata,
+   the entire pipeline breaks. Mitigation: validate metadata in Cloud Workflows
+   Step 1. Route to dead-letter bucket if required fields are missing. Never
+   ingest an undocumented file.
+
+RETRIEVAL SHORTCOMINGS
+-----------------------
+
+1. Query classifier is a single point of failure
+   Every query requires a Gemini Flash call. If the LLM is unavailable,
+   nothing works. Mitigation: the regex-based fallback classifier handles ~60%
+   of queries without any LLM call. The remaining 40% fall back to Data Store
+   semantic search if classification fails.
+
+2. AuraDB shared tier latency variability
+   On AuraDB Professional (shared compute), noisy neighbors can spike your
+   latency 2–3x unexpectedly. Mitigation: use AuraDB Enterprise (dedicated
+   compute) for production. Redis cache absorbs repeated queries.
+
+3. No chunk-level bridge between Data Store and AuraDB
+   The Firestore mapping links at document level (contract_id).
+   It cannot say "this specific sentence corresponds to this specific Milestone node."
+   Mitigation: acceptable for v1. Build chunk-level mapping in v2 if precision
+   matters for specific use cases.
+
+4. External callers can access wrong contracts if auth is misconfigured
+   Mitigation: row-level security in the Query API. Every external caller gets
+   an automatic filter: only return contracts where caller's organization is
+   a named Party node. Confidentiality filter: never return "Honeywell Confidential"
+   documents to external callers.
+
+5. Multi-turn conversation without state
+   The Query API is stateless. A follow-up question ("which of those expire?")
+   has no context from the previous turn. Mitigation: the Vertex AI Agent SDK
+   maintains conversation history and injects prior context into tool calls.
+   For raw API callers: implement session_id → context in Redis.
+
+6. BI tools cannot directly query AuraDB
+   Looker, Tableau, BigQuery cannot connect to Neo4j natively.
+   Mitigation: nightly APOC export from AuraDB → GCS → BigQuery.
+   BI tools connect to BigQuery. 24h lag is acceptable for dashboards.
+
+7. No freshness signal in responses
+   The response doesn't tell the caller whether the data is 5 minutes or
+   2 weeks old. Mitigation: include ingested_at + revision in every source
+   citation so callers can compare against LEAP's freeze_timestamp.
+
+
+================================================================================
+PART 13: MONITORING & DEBUGGING — GCP NATIVE AND DATADOG
+================================================================================
+
+GCP NATIVE vs DATADOG — DECISION
+----------------------------------
+
+                      GCP Native                   Datadog
+                      ----------                   -------
+Cost                  Included in GCP infra        ~$15–25/host/month + APM
+Setup                 Zero config for GCP services  Agent install + config
+GCP service coverage  Native (automatic)           Via GCP integration (pull)
+Neo4j monitoring      Prometheus scrape → GCP      Native Neo4j check available
+Application tracing   Cloud Trace                  Better APM, code-level spans
+Log correlation       Cloud Logging + Analytics    Better cross-service correlation
+Dashboards            Cloud Monitoring             More powerful, faster iteration
+Alerting              Cloud Alerting               More flexible, PagerDuty native
+
+Recommendation:
+  Use GCP native for this project — all infrastructure is on GCP, costs are
+  lower, and setup is zero-configuration for Vertex AI, GCS, and Cloud Run.
+  Add Datadog only if: (a) Neo4j is on-prem or multi-cloud, (b) team already
+  uses Datadog company-wide, or (c) Honeywell's vendor approval list includes it.
+
+IS DATADOG ALLOWED ON GCP?
+----------------------------
+Technically: yes. Datadog installs an agent on your compute resources and sends
+telemetry to Datadog's SaaS. GCP has no restriction on this.
+Practically: in a Honeywell enterprise context, check:
+  - Is Datadog in Honeywell's approved vendor list?
+  - Does IT policy allow sending telemetry data outside GCP (data sovereignty)?
+  - Is there an existing enterprise Datadog license?
+  If yes to all: use Datadog for the better Neo4j integration and APM.
+  If uncertain: default to GCP native — it's always approved.
+
+DATADOG SETUP ON GCP (if approved)
+-------------------------------------
+Step 1: Install agent on the Neo4j host (GCE VM)
+  DD_API_KEY=<key> DD_SITE="datadoghq.com" bash -c \
+    "$(curl -L https://install.datadoghq.com/scripts/install_script_agent7.sh)"
+
+Step 2: Enable Neo4j integration
+  # /etc/datadog-agent/conf.d/neo4j.d/conf.yaml
+  instances:
+    - neo4j_url: http://localhost:7474
+      username: neo4j
+      password: <password>
+      tags: [project:contract-intelligence, env:production]
+
+Step 3: Enable GCP integration (pull GCP metrics into Datadog)
+  In Datadog UI → Integrations → Google Cloud Platform.
+  Create GCP service account with roles:
+    roles/monitoring.viewer, roles/cloudasset.viewer, roles/compute.viewer
+  Paste JSON key into Datadog integration form.
+  This automatically pulls Vertex AI, GCS, Cloud Run metrics.
+
+Step 4: Python APM with ddtrace
+  pip install ddtrace
+  from ddtrace import tracer, patch_all
+  patch_all()   # auto-instruments neo4j driver, requests, etc.
+
+  with tracer.trace("ingest.contract", service="contract-ingestion",
+                    resource=contract_id) as span:
+      span.set_tag("contract.id", contract_id)
+      with tracer.trace("ingest.entity_resolution"): ...
+      with tracer.trace("ingest.neo4j_write"): ...
+      with tracer.trace("ingest.vector_upsert"): ...
+
+Step 5: Custom metrics with DogStatsD
+  from datadog import DogStatsd
+  statsd = DogStatsd()
+  statsd.gauge("ingestion.duration_ms", elapsed_ms,
+               tags=[f"source:{source}", f"contract:{contract_id}"])
+  statsd.gauge("ingestion.possible_edge_rate",
+               possible_edges / max(total_edges, 1))
+
+GCP NATIVE IMPLEMENTATION
+---------------------------
+
+Step 1: Structured logging
+  from google.cloud import logging as gcp_logging
+  import google.cloud.logging
+  gcp_logging.Client().setup_logging()  # routes Python logging to Cloud Logging
+
+  # After ingesting a contract:
+  log.info("contract_ingested", extra={"json_fields": {
+      "event": "contract_ingested",
+      "contract_id": contract_id,
+      "pages_processed": page_count,
+      "nodes_created": stats["nodes"],
+      "edges_created": stats["edges"],
+      "possible_edges": stats["possible_edges"],
+      "entity_merges": stats["merges"],
+      "metadata_hits": stats["metadata_hits"],
+      "low_confidence_skipped": stats["skipped"],
+      "duration_ms": round(elapsed * 1000),
+      "source": source,
+  }})
+
+  # After classifying a query:
+  log.info("query_classified", extra={"json_fields": {
+      "event": "query_classified",
+      "template": template_name,
+      "slots": slots,
+      "result_count": len(results),
+      "latency_ms": round(query_latency * 1000),
+      "cache_hit": was_cache_hit,
+  }})
+
+  # For unclassified queries:
+  log.warning("query_unclassified", extra={"json_fields": {
+      "event": "query_unclassified",
+      "raw_query": raw_query,
+      "query_hash": query_hash,
+      "fallback": "vector_search",
+  }})
+
+Step 2: Log-based metrics (Cloud Logging → Cloud Monitoring)
+  In GCP Console → Cloud Logging → Log-based Metrics → Create Metric:
+
+  ingestion_duration_ms:
+    Filter: jsonPayload.event="contract_ingested"
+    Type: Distribution, Field: jsonPayload.duration_ms
+
+  possible_edge_count:
+    Filter: jsonPayload.event="contract_ingested"
+    Type: Counter (sum of jsonPayload.possible_edges)
+
+  entity_merge_count:
+    Filter: jsonPayload.event="contract_ingested"
+    Type: Counter (sum of jsonPayload.entity_merges)
+
+  unclassified_query_count:
+    Filter: jsonPayload.event="query_unclassified"
+    Type: Counter
+
+  query_cache_hit:
+    Filter: jsonPayload.event="query_classified"
+    Type: Counter, Label: jsonPayload.cache_hit
+
+Step 3: Distributed tracing (Cloud Trace)
+  from opentelemetry import trace
+  from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
+  from opentelemetry.sdk.trace import TracerProvider
+  from opentelemetry.sdk.trace.export import BatchSpanProcessor
+  from opentelemetry.sdk.resources import Resource
+
+  provider = TracerProvider(resource=Resource.create({"service.name": "contract-ingestion"}))
+  provider.add_span_processor(BatchSpanProcessor(CloudTraceSpanExporter()))
+  trace.set_tracer_provider(provider)
+  tracer = trace.get_tracer("contract-ingestion")
+
+  with tracer.start_as_current_span("ingest_contract") as span:
+      span.set_attribute("contract.id", contract_id)
+      span.set_attribute("contract.source", source)
+      for page in pages:
+          with tracer.start_as_current_span("ingest_page") as ps:
+              ps.set_attribute("page.number", page["page"])
+              with tracer.start_as_current_span("entity_resolution"): ...
+              with tracer.start_as_current_span("neo4j_write") as ns:
+                  ns.set_attribute("nodes.written", len(nodes))
+              with tracer.start_as_current_span("vector_upsert"): ...
+
+  This gives a flame graph in Cloud Trace for every ingestion run — see exactly
+  which step (entity resolution? AuraDB write? Data Store import?) is slow.
+
+Step 4: Error Reporting
+  from google.cloud import error_reporting
+  error_client = error_reporting.Client(service="contract-ingestion")
+  except Exception as e:
+      error_client.report_exception()  # auto-groups identical stack traces
+      log.error("ingestion_error", extra={"json_fields": {
+          "event": "ingestion_error",
+          "contract_id": contract_id, "error_type": type(e).__name__,
+          "error_message": str(e),
+      }})
+
+Step 5: Cloud Monitoring Dashboard panels
+  Panel 1: Ingestion Health (24h)
+    - contracts_ingested_total (counter)
+    - ingestion_errors_total (counter)
+    - p50 / p95 ingestion_duration_ms
+
+  Panel 2: Graph Quality
+    - possible_edge_ratio = possible_edges / total_edges (gauge, alert >30%)
+    - entity_resolution_merge_rate (gauge)
+    - metadata_hit_rate (gauge)
+
+  Panel 3: Query Performance
+    - p50 / p95 / p99 rag_end_to_end_latency_ms
+    - cache_hit_rate (gauge, target >60%)
+    - unclassified_query_rate (gauge, alert >5%)
+
+  Panel 4: AuraDB Health (from Prometheus scrape)
+    - neo4j_page_cache_hit_ratio (target >95%)
+    - neo4j_bolt_connections_opened_total
+    - neo4j_database_store_size_bytes
+
+Step 6: Alerting policies
+  Alert 1: OCR quality degradation
+    Condition: possible_edge_ratio > 0.30 for 60 minutes
+    Playbook: check source images for quality issues; review per-page logs
+
+  Alert 2: Ingestion pipeline down
+    Condition: ingestion_errors_total rate > 5 in 60 minutes
+    Playbook: check Cloud Logging for error_type; common causes: AuraDB
+              connection refused, Vertex AI quota exceeded
+
+  Alert 3: Template gap
+    Condition: unclassified_query_rate > 0.05
+    Playbook: pull unclassified query logs, cluster, add new templates
+
+  Alert 4: Cache degradation
+    Condition: neo4j_page_cache_hit_ratio < 0.90 for 30 minutes
+    Playbook: increase pagecache.size in AuraDB config; cache went cold after
+              large ingestion batch
+
+  Alert 5: Sync drift
+    Condition: reconciliation_gap count > 0
+    Playbook: run ingest for contracts in AuraDB but missing from Data Store
+
+DEBUGGING PLAYBOOKS
+---------------------
+
+Problem: "Query returns no results but the data exists"
+  1. Check entity resolution:
+       MATCH (p:Party) WHERE p.canonical_name CONTAINS 'Boeing' RETURN p
+     Does canonical_name in AuraDB match what the query classifier extracted?
+  2. Check confidence gate:
+       MATCH (c:Contract)-[r]->(p:Party {canonical_name: 'Boeing'})
+       RETURN type(r), r.confidence
+     Is it POSSIBLE_PARTY_TO instead of PARTY_TO?
+  3. Check template slot extraction:
+     Log classified intent + slots before executing. Is the slot wrong?
+
+Problem: "Ingestion is slow"
+  1. Open Cloud Trace → flame graph → find the slowest span.
+  2. If neo4j_write span is slow: check page cache hit ratio; add missing indexes.
+  3. If entity_resolution is slow: registry is large; pre-load from persisted state.
+  4. If vector_upsert is slow: batch the datapoints instead of one per call.
+
+Problem: "Duplicate Party nodes in AuraDB after ingestion"
+  1. Check SIMILARITY_THRESHOLD — may need to be lowered.
+  2. Check legal suffix list — is the variant covered?
+  3. Check cross-run persistence — was the registry seeded from existing nodes?
+  4. Manual merge:
+       MATCH (a:Party {canonical_name: 'Honeywell Aerospace'})
+       MATCH (b:Party {canonical_name: 'Honeywell'})
+       CALL apoc.refactor.mergeNodes([a, b], {properties: 'combine'})
+       YIELD node RETURN node
+
+Problem: "Data Store returns results but graph lookup misses"
+  1. Check Firestore mapping: does the document_id have an entry?
+  2. Check that the contract exists in AuraDB:
+       MATCH (c:Contract {contract_id: $id}) RETURN c
+  3. If the contract was re-ingested (new element_ids), old vector metadata is stale.
+     Run reconciliation job. Re-ingest the affected contract to regenerate mapping.
+
+
+================================================================================
+PART 14: QUICK-REFERENCE DECISION MATRIX
+================================================================================
+
+WHICH STORE TO QUERY?
+  Semantic / "find similar" / "clauses about X"      → Data Store (semantic search)
+  Structural / "who is involved" / "what milestones"  → AuraDB (Cypher template)
+  Named entity in query (party name, contract number)  → AuraDB first, Data Store second
+  Global / aggregate / "how many" / "most common"     → AuraDB (precomputed summaries)
+  Ambiguous                                           → Both in parallel, merge results
+  No Cypher template matches                          → Data Store only, log as unclassified
+
+WHICH CYPHER TEMPLATE?
+  Party / company names in query    → Category A (entity lookup)
+  "milestones" / "deliverables"     → Category B (relationship traversal)
+  Two entities + a condition        → Category C (multi-hop)
+  "parent" / "child" / "supersedes" → Category D (lineage)
+  Date / time / "expiring" / "due"  → Category E (time-based)
+  "$" / "value" / "worth"           → Category F (financial)
+  "active" / "expired" / "status"   → Category G (status / classification)
+  "most common" / "breakdown"       → Category H (global aggregation)
+  None of the above                 → fall back to Data Store, log as unclassified
+
+EDGE CONFIDENCE LEVEL?
+  PDF text + has properties:                   ~0.945 → hard edge
+  Photographed + clear image + has properties: ~0.735 → hard edge
+  Photographed + moderate + no properties:     ~0.632 → POSSIBLE_* edge
+  Photographed + poor image:                   ~0.532 → POSSIBLE_* edge
+  Any source, score < 0.60:                           → do not write; review queue
+
+CACHE OR NOT?
+  Same template + same slots as recent query   → return from Redis
+  Time-relative slots ("expiring soon")        → never cache
+  POSSIBLE_* review queries                    → never cache
+  Contract ingested in the last 60 seconds     → bypass cache
+  External caller (row-level security filter)  → never share cache across callers
+
+GCP NATIVE vs DATADOG?
+  All infrastructure on GCP, standard team     → GCP native
+  Neo4j on-prem or multi-cloud                 → Datadog
+  Team already uses Datadog company-wide       → Datadog (unified view)
+  Datadog not in vendor list                   → GCP native (always approved)
+
+ORCHESTRATOR CHOICE?
+  Ingestion pipeline steps                     → Cloud Workflows
+  Complex ML DAG with many dependencies        → Cloud Composer (not this project)
+  Query-time routing and result merging        → Query API itself (in-process asyncio)
+  Conversational multi-turn interface          → Vertex AI Agent
+  Batch nightly jobs (summaries, reconcile)    → Cloud Scheduler → Cloud Run
+
+
+================================================================================
+PART 15: IMPLEMENTATION PRIORITY ORDER
+================================================================================
+
+WEEK 1: Ingestion foundation
+  □ Create GCS buckets (raw + processed)
+  □ Create Vertex AI Data Store, configure GCS source, test import with 3 contracts
+  □ Provision Neo4j AuraDB (Professional tier for development)
+  □ Deploy Cloud Run ingestion service (ingest_to_neo4j.py with all 12 flaws fixed)
+  □ Create Pub/Sub topics: contracts-landed, ingestion-complete, contracts-failed
+  □ Wire GCS notification → Pub/Sub (contracts-landed)
+  □ Test Branch B (AuraDB ingestion) end-to-end with 3 sample contracts
+
+WEEK 2: Orchestration and bridge
+  □ Deploy Cloud Workflows definition
+  □ Wire Cloud Workflows to Pub/Sub trigger
+  □ Deploy Firestore mapping service (write + read endpoints)
+  □ Test full parallel ingestion (both branches) end-to-end
+  □ Test revision handling (ingest v1 then v2 of same contract)
+  □ Deploy daily reconciliation job
+
+WEEK 3: Query API
+  □ Deploy Query API (Cloud Run, FastAPI, asyncio)
+  □ Implement query intent classifier (Gemini Flash)
+  □ Implement all 8 Cypher template categories (Part 8)
+  □ Wire Vertex AI Data Store search API
+  □ Wire Firestore mapping lookup at query time
+  □ Implement result merge and Gemini Pro answer generation
+  □ Set up Cloud Memorystore (Redis) for query cache
+
+WEEK 4: Access layer and monitoring
+  □ Set up API Gateway (rate limiting, API keys for external callers)
+  □ Implement row-level security (filter by caller organization + confidentiality)
+  □ Add structured logging to all services (Part 13 Step 1)
+  □ Add Cloud Trace spans (Part 13 Step 3)
+  □ Create Cloud Monitoring dashboard (4 panels from Part 13 Step 5)
+  □ Configure all 5 alerting policies
+  □ First Vertex AI Agent setup with 5 registered tools
+
+WEEK 5+: Production hardening
+  □ Upgrade AuraDB to Enterprise tier
+  □ Fix all 12 flaws in ingest_to_neo4j.py (Part 5)
+  □ Add confidence fields to extraction schemas (Part 7)
+  □ Build human review UI for POSSIBLE_* edges
+  □ Implement chunk-level change detection for revision efficiency
+  □ BigQuery nightly export + Looker dashboard setup
+  □ Workato recipe integration testing with LEAP team
+  □ Load testing: 100 concurrent queries, 50 concurrent ingestion workflows
+  □ First weekly template growth cycle (cluster unclassified queries, add templates)
+
+================================================================================
+END OF DOCUMENT
+Generated: August 2026
+Project: Honeywell Aerospace — Contract Intelligence Platform
+Architecture: GCP (Vertex AI Data Store + Neo4j AuraDB + Cloud Workflows)
+Prior documents consolidated: Contract_Intelligence_Platform_Architecture.txt,
+  Contract_Intelligence_Deep_Dive.txt, Contract_Intelligence_GCP_Architecture_Flows.txt
+================================================================================

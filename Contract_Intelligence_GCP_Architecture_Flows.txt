@@ -1,0 +1,1111 @@
+================================================================================
+  CONTRACT INTELLIGENCE PLATFORM — GCP ARCHITECTURE & DATA FLOWS
+  Vertex AI Data Store + Neo4j AuraDB + Cloud Workflows
+  Honeywell Aerospace
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+  1.  System Overview — What Each Service Does
+  2.  Flow 1: Ingestion — GCS → Vertex AI Data Store + Neo4j AuraDB
+        2a. Step-by-step ingestion walkthrough
+        2b. The bridge problem — linking Data Store chunks to AuraDB nodes
+        2c. Handling LEAP contract revisions
+  3.  Flow 2: Retrieval — External Systems → Query API → Data Store / AuraDB
+        3a. Who the callers are
+        3b. Query routing logic inside the Query API
+        3c. Vertex AI Agent integration (the copilot layer)
+  4.  Shortcomings — Ingestion
+  5.  Shortcomings — Retrieval
+  6.  Do You Need an Orchestrator?
+        6a. Ingestion: Cloud Workflows (the right tool, why not Composer)
+        6b. Retrieval: the Query API IS the orchestrator
+        6c. AI Agent layer: Vertex AI Agent with Tool Calling
+  7.  The One Thing That Breaks Everything — The Firestore Mapping Table
+  8.  Full Architecture Diagram
+  9.  Implementation Priority Order
+
+
+================================================================================
+1. SYSTEM OVERVIEW — WHAT EACH SERVICE DOES
+================================================================================
+
+SOURCE SYSTEM
+  LEAP (Honeywell internal)
+    Contract storage system. When a contract is finalized ("frozen"), LEAP
+    holds the canonical copy. All downstream systems read from LEAP, not from
+    email or file shares.
+
+INTEGRATION LAYER
+  Workato
+    iPaaS (integration platform). Two recipes:
+    1. Event-driven recipe: fires when LEAP freezes a contract → pushes PDF +
+       metadata to GCS. This is the ongoing, real-time feed.
+    2. Batch backfill recipe: one-time historical export of all existing
+       frozen contracts to GCS. Run first, then switch on event-driven.
+    Metadata that MUST travel with every file from Workato:
+      - contract_id (stable across revisions)
+      - revision_number
+      - freeze_timestamp
+      - document_type (main agreement, SOW, exhibit, amendment, etc.)
+      - confidentiality_marking (carry from LEAP, do not re-derive downstream)
+      - parent_contract_id (if this is an amendment or child agreement)
+
+STORAGE (LANDING ZONE)
+  Google Cloud Storage (GCS)
+    Raw contracts land here. The bucket is the source of truth for raw files.
+    Two separate GCS buckets:
+      - gs://contracts-raw/          ← Workato writes here
+      - gs://contracts-processed/    ← pipeline writes extracted text, audit logs
+
+VECTOR DATABASE (MANAGED SEMANTIC SEARCH)
+  Vertex AI Data Store
+    A managed, fully serverless document search service. You point it at GCS
+    and it handles OCR, chunking, embedding, and vector indexing automatically.
+    You do not write embedding code or manage vector indexes directly.
+    What you control:
+      - Which GCS bucket/folder it imports from
+      - Import triggers (manual API call, or scheduled)
+      - Search configuration (semantic, full-text, or hybrid)
+      - Access control (who can search which documents)
+    What it controls (opaque to you):
+      - How it chunks documents (chunk boundaries, chunk size)
+      - Which embedding model it uses internally
+      - Indexing schedule (documents become searchable in 2–10 minutes)
+
+GRAPH DATABASE
+  Neo4j AuraDB (managed Neo4j on GCP)
+    Fully managed Neo4j cloud service. You connect to it via the Bolt protocol
+    using the standard Neo4j Python driver — same code as self-hosted Neo4j.
+    AuraDB runs in a GCP region (choose the same region as your Cloud Run).
+    What AuraDB gives you vs. self-hosted:
+      - No infrastructure management (backups, patches, HA — all managed)
+      - Automatic daily backups with point-in-time restore
+      - Built-in monitoring in the AuraDB console
+    AuraDB tiers for this project:
+      - AuraDB Professional: up to 100 concurrent connections, shared compute.
+        Acceptable for early stage.
+      - AuraDB Enterprise: dedicated compute, up to 300+ connections, SLA.
+        Required for production at scale.
+
+INGESTION ORCHESTRATOR
+  Cloud Workflows
+    Lightweight, fully serverless step orchestration. No infrastructure.
+    Executes a sequence of API calls (import to Data Store, trigger Neo4j
+    ingestion) with built-in retry, parallelism, and execution history.
+    NOT Cloud Composer (Airflow) — that is heavier, for ML pipelines with
+    complex DAG dependencies. Cloud Workflows is the right tool here.
+
+CUSTOM INGESTION SERVICE
+  Cloud Run (Neo4j ingestion service)
+    A containerized FastAPI or Flask service that:
+      1. Receives a Pub/Sub push message with GCS URI + contract metadata
+      2. Downloads the PDF from GCS
+      3. Runs Document AI for OCR (better than GPT vision for scanned docs)
+      4. Calls LLM (Gemini or GPT-4o) to extract entities and relationships
+      5. Runs EntityResolver for canonical name deduplication
+      6. Writes nodes and edges to AuraDB via Bolt
+      7. Returns AuraDB node IDs to Cloud Workflows
+
+BRIDGE / MAPPING LAYER
+  Firestore
+    A small lookup table mapping Vertex AI Data Store chunk IDs to AuraDB
+    node IDs. This is the critical link between the two stores at query time.
+    Without this, semantic search results from Data Store cannot be connected
+    to graph nodes in AuraDB. See Section 7 for why this is the most
+    important piece to get right.
+
+QUERY API (UNIFIED FRONT DOOR)
+  Cloud Run (Query API service)
+    The only entry point for external callers. Internal or external systems
+    never query AuraDB or Vertex AI Data Store directly. This service:
+      - Authenticates the caller
+      - Classifies the query intent (LLM call)
+      - Routes to Data Store, AuraDB, or both
+      - Merges results
+      - Generates a final LLM answer
+      - Returns a unified structured response
+
+EVENT BUS
+  Cloud Pub/Sub
+    Two topics:
+    - contracts-landed: GCS fires this when a new file arrives. Cloud Workflows
+      subscribes to start the ingestion pipeline.
+    - ingestion-complete: Cloud Workflows fires this when both branches (Data
+      Store + AuraDB) have finished. Downstream systems (dashboards, cache
+      warmers) subscribe.
+
+
+================================================================================
+2. FLOW 1: INGESTION — GCS → VERTEX AI DATA STORE + NEO4J AURADB
+================================================================================
+
+2a. STEP-BY-STEP INGESTION WALKTHROUGH
+----------------------------------------
+
+Step 1: Contract freezes in LEAP
+  Workato recipe fires. It attaches metadata (contract_id, revision,
+  document_type, confidentiality_marking, parent_contract_id) and pushes the
+  PDF to:  gs://contracts-raw/{contract_id}/{revision}/contract.pdf
+
+  Metadata is written as GCS object metadata (key-value pairs on the object
+  itself) so any downstream service that reads the file also gets the metadata.
+  Idempotency key: "{contract_id}_{revision}_{freeze_timestamp}" — if Workato
+  retries, the same object is overwritten, not duplicated.
+
+Step 2: GCS fires "object finalized" event
+  Cloud Storage Notifications → Pub/Sub topic: contracts-landed
+  Message payload: {bucket, name (object path), metadata, size, contentType}
+
+Step 3: Cloud Workflows receives the Pub/Sub trigger
+  A Cloud Workflows trigger (connected to the Pub/Sub subscription) starts
+  a new workflow execution with the event payload.
+
+Step 4: Cloud Workflows runs two branches IN PARALLEL
+
+  BRANCH A: Vertex AI Data Store Import
+    Cloud Workflows calls the Data Store Documents API:
+      POST https://discoveryengine.googleapis.com/v1/projects/{PROJECT}/
+           locations/global/dataStores/{DATASTORE_ID}/branches/default_branch/
+           documents:import
+
+      Body: {
+        "gcsSource": {
+          "inputUris": ["gs://contracts-raw/{contract_id}/{revision}/contract.pdf"],
+          "dataSchema": "content"
+        },
+        "reconciliationMode": "INCREMENTAL",
+        "idField": "contract_id_revision"  ← use composite key as stable doc ID
+      }
+
+    Data Store handles the rest: OCR (for scanned pages), text extraction,
+    chunking, embedding, and indexing. No code to write for this branch.
+    Data Store returns a document_id for the ingested document.
+    Indexing lag: 2–10 minutes before this document is searchable.
+
+  BRANCH B: Neo4j AuraDB Ingestion (runs in parallel with Branch A)
+    Cloud Workflows calls the Cloud Run ingestion service:
+      POST https://ingestion-service-{hash}.run.app/ingest
+      Body: {
+        "gcs_uri": "gs://contracts-raw/{contract_id}/{revision}/contract.pdf",
+        "contract_id": "HC-2023-001",
+        "revision": 3,
+        "document_type": "sales_agreement",
+        "parent_contract_id": "HC-2019-001"  ← if amendment
+      }
+
+    Inside the Cloud Run ingestion service:
+      a) Download PDF from GCS
+      b) Send to Document AI (Processor: DOCUMENT_OCR or FORM_PARSER)
+         → Returns clean, structured text per page
+      c) For each page, call LLM (Gemini Pro or GPT-4o-mini) with
+         SYSTEM_PROMPT from graph_schema_extractor.py
+         → Returns: {nodes: [...], edges: [...]}
+      d) Run EntityResolver (seeded from existing AuraDB nodes)
+         → Canonical names, fuzzy dedup
+      e) For each node: AuraDB MERGE (not CREATE)
+         → Returns element_id for each node
+      f) For each edge: AuraDB MERGE with confidence gating
+         → POSSIBLE_* prefix for low-confidence edges
+      g) Return {aura_node_ids: [...], pages_processed: N, nodes: N, edges: N}
+
+Step 5: Cloud Workflows waits for BOTH branches to complete (join)
+  If either branch fails: Cloud Workflows logs the failure, retries the
+  failed branch up to 3 times with exponential backoff.
+  If both succeed: proceed to Step 6.
+
+Step 6: Write the bridge mapping to Firestore
+  Cloud Workflows calls a lightweight Cloud Function or Cloud Run endpoint:
+    POST /register-mapping
+    Body: {
+      "contract_id": "HC-2023-001",
+      "revision": 3,
+      "datastore_document_id": "{ds_doc_id}",  ← from Branch A
+      "aura_node_ids": ["{eid1}", "{eid2}", ...],  ← from Branch B
+      "ingested_at": "2026-08-19T10:23:00Z"
+    }
+
+  Firestore document structure:
+    Collection: contract_mappings
+    Document ID: "{contract_id}_{revision}"
+    Fields:
+      contract_id: "HC-2023-001"
+      revision: 3
+      datastore_document_id: "ds-doc-abc123"
+      aura_node_ids: ["4:abc...", "4:def..."]
+      ingested_at: timestamp
+      status: "complete"
+
+Step 7: Publish ingestion-complete event
+  Cloud Workflows publishes to Pub/Sub: ingestion-complete
+  {contract_id, revision, datastore_document_id, aura_node_count, status}
+  Downstream subscribers:
+    - Cache warmer: pre-runs common Cypher queries for this contract
+    - Notification service: alerts the contract owner that the contract is
+      now searchable
+    - Reconciliation tracker: marks this contract as ingested in the audit log
+
+
+2b. THE BRIDGE PROBLEM — LINKING DATA STORE CHUNKS TO AURADB NODES
+--------------------------------------------------------------------
+
+Vertex AI Data Store chunks a document internally. When a user searches and
+Data Store returns a chunk, you get:
+  - The chunk's text content
+  - The document_id (your composite key: contract_id + revision)
+  - The chunk's position (page number, character offset)
+
+You do NOT get a direct link to the AuraDB node that represents the same entity.
+
+The Firestore mapping resolves this at the document level:
+  "This Data Store document_id corresponds to these AuraDB node IDs."
+
+For chunk-level precision (which specific sentence → which specific AuraDB node),
+you would need to build a more granular mapping. For the first version, document-
+level mapping is sufficient: when Data Store returns a chunk from HC-2023-001,
+you know to start your AuraDB graph traversal from the Contract node for HC-2023-001.
+
+How to use the mapping at query time:
+  1. Data Store returns chunks: [{text: "...", document_id: "HC-2023-001_3"}, ...]
+  2. Extract document_ids from results
+  3. Look up Firestore: contract_mappings["HC-2023-001_3"] → aura_node_ids
+  4. Query AuraDB:
+     MATCH (c:Contract {contract_id: "HC-2023-001"})
+     OPTIONAL MATCH (c)-[:PARTY_TO]->(p:Party)
+     OPTIONAL MATCH (c)-[:HAS_MILESTONE]->(m:Milestone)
+     RETURN c, collect(p), collect(m)
+  5. Merge: chunk text (from Data Store) + graph context (from AuraDB)
+  6. Feed merged context to LLM for final answer generation
+
+
+2c. HANDLING LEAP CONTRACT REVISIONS
+--------------------------------------
+
+LEAP creates a new frozen document on each amendment. The same contract HC-2023-001
+might have revision 1, 2, 3 as it gets amended over time.
+
+In Vertex AI Data Store:
+  - Import with document_id = "{contract_id}_{revision}"
+  - Earlier revisions remain searchable (for audit/history)
+  - Default search filter: only return latest revision
+    → Add a filter on "revision = max(revision) WHERE contract_id = X"
+    → OR use Data Store's metadata filtering to tag latest=true/false and
+       filter on latest=true by default
+
+In Neo4j AuraDB:
+  - Contract nodes are versioned: (c:Contract {contract_id, revision})
+  - The same Party, Standard, Milestone nodes may connect to multiple revisions
+  - New revision: run the ingestion pipeline → MERGE creates new Contract node
+    for this revision → write SUPERSEDES edge from new to old:
+      MERGE (new:Contract {contract_id: $id, revision: $new_rev})
+      MERGE (old:Contract {contract_id: $id, revision: $old_rev})
+      MERGE (new)-[:SUPERSEDES]->(old)
+  - Most queries should filter to the latest revision by default:
+      MATCH (c:Contract {contract_id: $id})
+      WHERE NOT ()-[:SUPERSEDES]->(c)  ← no contract supersedes it = it is latest
+      RETURN c
+
+Chunk-level change detection (efficiency optimization, not required for v1):
+  At ingestion time, hash the text of each page (SHA256 of normalized text).
+  Compare to the hash from the previous revision stored in AuraDB or Firestore.
+  If hash matches: skip LLM extraction for that page (reuse prior nodes/edges).
+  Only re-extract pages where the hash changed.
+  Benefit: for a 100-page contract where 3 pages changed, you run LLM extraction
+  on 3 pages instead of 100. Saves ~97% of LLM cost per revision.
+
+
+================================================================================
+3. FLOW 2: RETRIEVAL — EXTERNAL SYSTEMS → QUERY API → DATA STORE / AURADB
+================================================================================
+
+3a. WHO THE CALLERS ARE
+------------------------
+
+  Type 1: Vertex AI Agent (the conversational copilot)
+    A Gemini-powered agent deployed for Honeywell contract teams. Users talk
+    to it in natural language. The agent calls the Query API as a registered
+    tool. The agent maintains conversation history; the Query API is stateless.
+
+  Type 2: Honeywell internal systems (service-to-service)
+    CLM tools, ERP systems, dashboards that need contract data.
+    Auth: IAM Workload Identity Federation (service account, no API keys).
+    They call: POST /query, GET /contract/{id}, GET /expiring/{days}
+
+  Type 3: External partners or auditors
+    Via API Gateway: rate-limited, API-key authenticated.
+    Access scope: restricted to contracts they are a party to (row-level security
+    enforced in the Query API by filtering on party_name = caller's organization).
+
+  Type 4: BI / Analytics tools (Looker, BigQuery)
+    Not real-time queries. Instead, a scheduled Cloud Run job exports Neo4j
+    graph data to BigQuery via the APOC export plugin (AuraDB supports APOC).
+    Looker connects to BigQuery for dashboards and trend analysis.
+    This path bypasses the Query API — it is a separate export pipeline.
+
+
+3b. QUERY ROUTING LOGIC INSIDE THE QUERY API
+----------------------------------------------
+
+Every request to POST /query goes through this flow inside Cloud Run:
+
+  Step 1: Authenticate and authorize
+    Verify Bearer token (IAM) or API key (API Gateway).
+    Check caller's data access scope (which confidentiality tiers they can see).
+    Reject if not authorized; log all access attempts.
+
+  Step 2: Classify the query intent
+    LLM call (Gemini Flash — fast, cheap, ~100ms):
+      Classify into one of: [structured_intent, semantic_intent, hybrid, global]
+      Extract slot values (party_name, contract_id, date range, etc.)
+      Return: {intent_type, template_name, slots}
+
+    Fallback (if LLM call fails or times out):
+      Regex-based classifier for the 10 most common patterns:
+        - Contract number pattern (e.g. HC-\d{4}-\d{3}) → template: contract_by_id
+        - "expir" keyword → template: expiring_soon
+        - "Boeing"/"Raytheon"/known party names → template: contracts_by_party
+        - etc.
+      This ensures the system never fully fails on LLM outage.
+
+  Step 3: Route based on intent type
+
+    STRUCTURED_INTENT → AuraDB only
+      Use case: "What milestones are in contract HC-2023-001?"
+      → Look up Cypher template in TEMPLATE_REGISTRY
+      → Execute with extracted slots
+      → Serialize result as structured JSON
+      → Feed to LLM for natural language answer generation
+
+    SEMANTIC_INTENT → Vertex AI Data Store only
+      Use case: "Find clauses similar to this indemnification language"
+      → Call Data Store search API with the raw query text
+      → Data Store returns top-k matching chunks with relevance scores
+      → Feed chunks to LLM for answer generation
+
+    HYBRID (most common) → both in parallel
+      Use case: "Tell me about Boeing contracts that expire this year"
+      → AuraDB Cypher: get contract IDs, parties, dates (structured facts)
+      → Data Store: get relevant clause text (semantic context)
+      → Firestore mapping: link Data Store chunks to AuraDB nodes
+      → Merge: {structured_facts} + {clause_text} → LLM context
+      → LLM generates answer with both structural and textual grounding
+
+    GLOBAL / AGGREGATION → AuraDB only (pre-computed summaries)
+      Use case: "Which party has the most contracts with us?"
+      → Use precomputed summary nodes in AuraDB (updated nightly)
+      → Sub-100ms response, no LLM classification step needed
+
+    UNCLASSIFIED → Data Store only (fallback)
+      Log the raw query as "unclassified" (feeds the weekly template growth job)
+      Fall back to pure semantic search
+      Note in the response: "This answer is based on text search only.
+      Structured contract data was not available for this query type."
+
+  Step 4: Execute query (with Redis cache check first)
+    Check Cloud Memorystore (Redis) for cached result.
+    Cache key: SHA256(template_name + sorted_slots) for structured queries,
+               SHA256(query_text) for semantic queries.
+    Cache hit → return immediately, log as cache_hit=true.
+    Cache miss → execute, write to cache with TTL, return result.
+    Skip cache for time-sensitive queries: expiring_soon, recently_modified.
+
+  Step 5: Generate final answer
+    Feed merged context (graph data + chunk text) to Gemini Pro.
+    System prompt instructs the model to:
+      - Cite the contract_id for every fact it states
+      - Say "I don't have that information" rather than hallucinating
+      - Use exact figures from the structured data, not paraphrased numbers
+    Response format:
+      {
+        "answer": "Three Boeing contracts expire in the next 90 days...",
+        "sources": [
+          {"contract_id": "HC-2023-001", "party": "Boeing",
+           "expiry": "2026-09-15", "value_usd": 4500000,
+           "evidence_chunk": "The term of this Agreement shall expire..."}
+        ],
+        "intent": "contracts_by_party",
+        "template_used": "active_contracts_expiring_for_party",
+        "cache_hit": false,
+        "latency_ms": 340
+      }
+
+  Step 6: Log and return
+    Emit structured log: {query_hash, intent, template, result_count,
+                          cache_hit, latency_ms, caller_id}
+    Return response to caller.
+
+
+3c. VERTEX AI AGENT INTEGRATION (THE COPILOT LAYER)
+-----------------------------------------------------
+
+The Agent layer sits ABOVE the Query API. The Agent (Gemini) does not directly
+talk to AuraDB or Data Store — it only calls the Query API as registered tools.
+
+Tool definitions registered with the Vertex AI Agent:
+
+  Tool 1: query_contracts
+    Description: "Answer any question about Honeywell contract data"
+    Input: {question: string}
+    Action: POST https://query-api.run.app/query {question}
+    When to use: any contract-related question
+
+  Tool 2: get_contract_detail
+    Description: "Get full details for a specific contract by ID"
+    Input: {contract_id: string}
+    Action: GET https://query-api.run.app/contract/{contract_id}
+    When to use: user provides an explicit contract number
+
+  Tool 3: list_expiring_contracts
+    Description: "List contracts expiring within N days"
+    Input: {days: integer}
+    Action: GET https://query-api.run.app/expiring/{days}
+    When to use: user asks about renewals, expirations, upcoming deadlines
+
+  Tool 4: compare_contracts
+    Description: "Compare two contracts side by side"
+    Input: {contract_id_a: string, contract_id_b: string}
+    Action: POST https://query-api.run.app/compare {ids: [a, b]}
+    When to use: "how does contract X differ from contract Y?"
+
+The Agent manages:
+  - Conversation history (multi-turn context)
+  - Deciding WHICH tool to call
+  - Combining tool responses when multiple calls are needed
+  - Formatting the final answer for the user
+
+The Query API does NOT need to know about conversation history. It is stateless.
+Each tool call is independent.
+
+Session state for multi-turn (managed in Cloud Memorystore):
+  - session_id → {last_entities_mentioned: ["Boeing", "HC-2023-001"],
+                   last_template: "contracts_by_party", turn_count: 3}
+  - The Agent SDK can maintain this automatically; alternatively, pass
+    session_id in API headers and the Query API hydrates context from Redis.
+
+
+================================================================================
+4. SHORTCOMINGS — INGESTION
+================================================================================
+
+SHORTCOMING 1: Vertex AI Data Store chunking is a black box
+  Data Store decides how to split your PDFs into chunks. You cannot set chunk
+  size, chunk overlap, or section-aware boundaries. A critical clause (e.g. a
+  payment term that spans 3 sentences) might be split across two chunks, with
+  each chunk too short to be semantically meaningful on its own.
+  Impact: semantic search quality is lower than if you controlled chunking.
+  Mitigation: enable "extractive segments" in Data Store configuration — it
+  uses document structure (headers, paragraphs) as natural boundaries. This is
+  better than fixed-size chunking but still opaque.
+  Longer-term fix: if chunk quality is a recurring problem, build a custom
+  chunking pipeline (Cloud Run) and ingest pre-chunked text to Data Store
+  instead of raw PDFs. This gives full control but removes the "managed" benefit.
+
+SHORTCOMING 2: Data Store indexing lag (2–10 minutes)
+  After Branch A completes, the document is NOT immediately searchable.
+  Impact: if a user searches for a just-uploaded contract, they get no results.
+  Mitigation: the ingestion-complete Pub/Sub event (Step 7) fires immediately
+  when the pipeline finishes — but Data Store may still be indexing. Add a
+  status endpoint: GET /contract/{id}/status → {"auradb": "ready",
+  "datastore": "indexing"} — callers can poll before querying.
+  Note: this is a known limitation of Vertex AI Data Store. It is not fixable
+  without switching to a self-managed vector store (where you control indexing).
+
+SHORTCOMING 3: No atomic cross-store write
+  Neo4j AuraDB and Vertex AI Data Store are two separate systems. There is no
+  distributed transaction across them. If Branch B (AuraDB) succeeds and
+  Branch A (Data Store) fails on the third retry, the contract is in the graph
+  but not in the vector index. Queries that go to Data Store miss it entirely.
+  Impact: silent partial ingestion. The user never knows the contract is only
+  half-searchable.
+  Mitigation: the reconciliation job (daily) catches this. The ingestion-complete
+  event is only published when BOTH branches succeed. The Firestore mapping is
+  only written on full success. If the mapping is absent for a contract_id, that
+  is a signal that ingestion is incomplete — queryable via:
+    SELECT contract_id FROM contracts WHERE status != 'complete' (Firestore query)
+
+SHORTCOMING 4: Contract ordering — amendments before master agreements
+  Pub/Sub does not guarantee ordering. If Workato pushes a master agreement (HC-
+  2019-001) and an amendment (HC-2023-001 with parent_contract_id=HC-2019-001)
+  in quick succession, the amendment's ingestion might start before the master
+  agreement is in AuraDB. The PARENT_OF edge cannot be written (parent node does
+  not exist yet).
+  Impact: lineage graph is incomplete for fast-arriving amendment batches.
+  Mitigation: in Branch B, after writing the Contract node, check if
+  parent_contract_id is set. If so, attempt to write the PARENT_OF edge.
+  If the parent node is not found (not yet in AuraDB), publish the edge-write
+  task to Cloud Tasks with a 3-minute delay. By then the parent will exist.
+
+SHORTCOMING 5: AuraDB connection cold-start from Cloud Run
+  Cloud Run is serverless. When no requests have come in for a few minutes,
+  instances scale to zero. The first request after a cold period must:
+  (a) start the Cloud Run container (~500ms), AND
+  (b) establish a Bolt TCP connection to AuraDB (~300ms).
+  Total cold-start penalty: ~800ms on top of the normal ingestion latency.
+  Impact: the first contract after an idle period is slow to ingest.
+  Mitigation: set min_instances=1 on the ingestion Cloud Run service so at
+  least one warm instance is always running. Cost: ~$15-20/month for the
+  always-warm instance. Worth it for production.
+
+SHORTCOMING 6: LLM extraction errors are silent
+  If the LLM (Gemini or GPT-4o-mini) returns malformed JSON, an empty node
+  list, or completely wrong entities, the pipeline writes nothing to AuraDB
+  (or writes incorrect nodes) with no visible error. The contract is "ingested"
+  but the graph is wrong.
+  Impact: queries for that contract return empty or wrong results.
+  Mitigation: after each page extraction, validate the result:
+    - Node count: must be > 0 for pages with text
+    - At least one Contract node must be present per document
+    - All required edge endpoints must exist in the node list
+  If validation fails, log the failure with the raw LLM output. Flag the
+  contract as "needs_review" in Firestore. Alert the operations team.
+
+SHORTCOMING 7: Document AI pricing and quota
+  Document AI (OCR) charges per page. Standard OCR: ~$0.0015/page.
+  At 10,000 pages/month: ~$15. At 1,000,000 pages/month: ~$1,500.
+  There is also a default quota of 15 pages/minute for some processors.
+  For large backfill runs (millions of historical contract pages), quota
+  increase must be requested in advance via the GCP support console.
+
+SHORTCOMING 8: Workato metadata gaps
+  If Workato does not correctly populate contract_id, revision_number, or
+  confidentiality_marking on the GCS object metadata, the entire downstream
+  pipeline breaks or misclassifies the document.
+  Impact: orphaned documents in GCS with no contract_id — they get ingested
+  into Data Store with a random document_id, and no AuraDB node is created
+  because the ingestion service cannot find the metadata.
+  Mitigation: validate GCS object metadata in Cloud Workflows Step 1 before
+  branching. If required metadata is missing, send the file to a dead-letter
+  GCS bucket and publish an alert to Pub/Sub: contracts-metadata-error.
+  Do NOT proceed with ingestion of an undocumented file.
+
+
+================================================================================
+5. SHORTCOMINGS — RETRIEVAL
+================================================================================
+
+SHORTCOMING 1: Query classifier is a single point of failure
+  Every query requires an LLM call to classify intent and extract slots.
+  If the classification LLM is unavailable, rate-limited, or slow, every
+  query is affected — not just complex ones.
+  Impact: complete Query API outage during LLM unavailability.
+  Mitigation: the regex-based fallback classifier (built into the Query API)
+  handles the 10 most common query patterns without any LLM call. These cover
+  ~60% of real-world queries. For the remaining 40%, if the LLM is unavailable,
+  fall back to pure Data Store semantic search (no graph traversal).
+
+SHORTCOMING 2: AuraDB shared tier latency variability (non-Enterprise)
+  On AuraDB Professional (shared compute), your queries share CPU with other
+  AuraDB tenants. During peak periods at Neo4j's data center, your query
+  latency can spike 2–3x unexpectedly.
+  Impact: p99 query latency is unpredictable on shared tier.
+  Mitigation: use AuraDB Enterprise (dedicated compute) for production.
+  The Redis cache also absorbs repeated queries, reducing AuraDB hit frequency.
+
+SHORTCOMING 3: Data Store and AuraDB have no native merge key at chunk level
+  When Data Store returns a chunk, you get document_id (contract-level).
+  When AuraDB returns a node, you get element_id and canonical_name.
+  Merging at the document level works (both have contract_id as a common key).
+  Merging at the clause/sentence level does not work without the Firestore
+  mapping AND requires granular chunk-to-node mapping, which the v1 design
+  does not build.
+  Impact: the merged response gives the user accurate graph facts AND relevant
+  clause text, but cannot say "THIS specific clause corresponds to THIS specific
+  milestone node." The connection is at contract level, not clause level.
+  Acceptable for v1. Build granular mapping in v2 if precision is needed.
+
+SHORTCOMING 4: External agents can be incorrectly authorized
+  If API keys are shared or not rotated, an external caller could access
+  contracts they are not a party to.
+  Impact: confidentiality breach.
+  Mitigation:
+    - API Gateway enforces rate limiting and key management
+    - Query API enforces row-level security: every query is automatically
+      filtered by the caller's organization:
+        MATCH (c:Contract)-[:PARTY_TO]->(caller_party)
+        WHERE caller_party.canonical_name = $caller_org
+      External callers only ever see contracts they are named in.
+    - Confidentiality filter: never return chunks from documents tagged
+      "Honeywell Confidential" to external callers (only internal IAM callers).
+
+SHORTCOMING 5: Multi-turn conversation without session state
+  The Query API is stateless. If a user asks "show Boeing contracts" (turn 1)
+  and then "which ones expire this year?" (turn 2), the second query has no
+  context that "Boeing" was established in turn 1. The classifier sees an
+  ambiguous question and may fall back to unclassified.
+  Impact: multi-turn conversations feel broken — users must repeat context.
+  Mitigation: the Vertex AI Agent SDK maintains conversation history natively.
+  The Agent injects prior context into each tool call:
+    "Given our earlier discussion about Boeing contracts,
+     which of those expire in the next 90 days?"
+  The Query API sees the full enriched question and classifies correctly.
+  If the Agent is not used (raw API callers), implement session_id → context
+  storage in Redis.
+
+SHORTCOMING 6: BI tools cannot directly query AuraDB
+  Tools like Looker, Tableau, or BigQuery cannot connect to Neo4j via JDBC/ODBC
+  without a custom connector. AuraDB is not natively a BI data source.
+  Impact: analytics and reporting use cases cannot be served from AuraDB directly.
+  Mitigation: nightly export pipeline using APOC (Neo4j's export library):
+    CALL apoc.export.json.all("gs://contracts-export/graph.json", {})
+  Then load into BigQuery:
+    bq load --source_format=NEWLINE_DELIMITED_JSON contracts.graph \
+      gs://contracts-export/graph.json schema.json
+  Looker, Data Studio, and other BI tools connect to BigQuery. This is a
+  read-only, slightly stale (24h lag) view of the graph — acceptable for
+  dashboards but not for real-time queries.
+
+SHORTCOMING 7: No real-time freshness signal in responses
+  When the Query API returns an answer, it does not tell the caller whether
+  the underlying contract data is 5 minutes old or 2 weeks old.
+  Impact: a caller might act on an answer that reflects an old revision of a
+  contract, not knowing a newer revision was frozen in LEAP yesterday.
+  Mitigation: include ingested_at timestamp in every source citation:
+    {"contract_id": "HC-2023-001", "revision": 3, "ingested_at": "2026-08-19"}
+  The caller can compare this to the freeze_timestamp in LEAP if freshness
+  matters for their use case.
+
+
+================================================================================
+6. DO YOU NEED AN ORCHESTRATOR?
+================================================================================
+
+Short answer: YES — two different orchestrators, for two different jobs.
+
+6a. INGESTION: CLOUD WORKFLOWS (NOT CLOUD COMPOSER)
+-----------------------------------------------------
+
+WHY NOT CLOUD COMPOSER (AIRFLOW)?
+  Cloud Composer is Google's managed Apache Airflow. It is designed for:
+    - Complex ML training pipelines with many interdependent steps
+    - DAGs (directed acyclic graphs) with dozens of tasks and conditional branches
+    - Long-running batch jobs (hours to days)
+    - Teams who already know Airflow
+  For your ingestion pipeline, Composer is massively overbuilt. It requires:
+    - A dedicated GKE cluster (always running, ~$200+/month just for infra)
+    - Airflow DAG authoring in Python
+    - Several minutes to deploy a new DAG version
+  That is overkill for "call two APIs in parallel and write to Firestore."
+
+WHY CLOUD WORKFLOWS?
+  Cloud Workflows is serverless (zero infrastructure, zero cost when idle).
+  It is purpose-built for orchestrating sequences of HTTP API calls.
+  It supports: parallel branches, retry with backoff, conditional logic,
+  step-level logging, and execution history in the GCP Console.
+  Cost: $0.01 per 1,000 internal steps. For 1,000 contracts/month with
+  ~10 steps each: $0.10/month. Essentially free.
+
+WHAT CLOUD WORKFLOWS HANDLES:
+  - Parallel execution of Branch A (Data Store) and Branch B (AuraDB)
+  - Waiting for both to complete before writing the Firestore mapping
+  - Retry logic: if AuraDB ingestion fails on the first attempt, retry
+    after 30 seconds, then 2 minutes, then 10 minutes
+  - Error routing: if all retries fail, publish to contracts-failed Pub/Sub topic
+  - Execution history: every workflow run has a visual step-by-step log
+    in the GCP Console with input/output at each step
+
+WHAT IT DOES NOT HANDLE (stays in Cloud Run):
+  - The actual entity extraction logic (LLM calls, EntityResolver)
+  - The actual Neo4j MERGE calls
+  - These stay in the Cloud Run ingestion service because they are too
+    complex for a workflow definition
+
+CLOUD WORKFLOWS DEFINITION (simplified, showing key structure):
+
+  main:
+    params: [args]
+    steps:
+      - init:
+          assign:
+            - gcs_uri: ${args.gcs_uri}
+            - contract_id: ${args.contract_id}
+            - revision: ${args.revision}
+
+      - validate_metadata:
+          condition: ${contract_id != null and revision != null}
+          next: parallel_ingest
+          else: route_to_dead_letter
+
+      - parallel_ingest:
+          parallel:
+            branches:
+              - branch_a_datastore:
+                  steps:
+                    - import_document:
+                        call: http.post
+                        args:
+                          url: ${"https://discoveryengine.googleapis.com/v1/..." + DATASTORE_ID + "/documents:import"}
+                          auth: {type: OAuth2}
+                          body:
+                            gcsSource:
+                              inputUris: [${gcs_uri}]
+                        result: ds_result
+              - branch_b_neo4j:
+                  steps:
+                    - ingest_to_neo4j:
+                        call: http.post
+                        args:
+                          url: https://ingestion-service.run.app/ingest
+                          auth: {type: OIDC}
+                          body:
+                            gcs_uri: ${gcs_uri}
+                            contract_id: ${contract_id}
+                            revision: ${revision}
+                        result: neo4j_result
+
+      - write_mapping:
+          call: http.post
+          args:
+            url: https://mapping-service.run.app/register
+            body:
+              contract_id: ${contract_id}
+              revision: ${revision}
+              datastore_doc_id: ${ds_result.body.documentId}
+              aura_node_ids: ${neo4j_result.body.node_ids}
+
+      - publish_completion:
+          call: googleapis.pubsub.v1.projects.topics.publish
+          args:
+            topic: ${"projects/" + PROJECT + "/topics/ingestion-complete"}
+            body:
+              messages:
+                - data: ${base64.encode(json.encode({contract_id, revision}))}
+
+      - route_to_dead_letter:
+          call: googleapis.pubsub.v1.projects.topics.publish
+          args:
+            topic: ${"projects/" + PROJECT + "/topics/contracts-metadata-error"}
+            body:
+              messages:
+                - data: ${base64.encode(json.encode({gcs_uri, error: "missing_metadata"}))}
+
+
+6b. RETRIEVAL: THE QUERY API IS THE ORCHESTRATOR
+--------------------------------------------------
+
+At query time, you do NOT need a separate orchestration service. The Query API
+(FastAPI on Cloud Run) IS the orchestrator:
+
+  1. Classifies intent → routes to the right backend(s)
+  2. Runs Data Store + AuraDB calls in parallel (using asyncio or threading)
+  3. Joins results
+  4. Calls LLM for answer generation
+  5. Returns the response
+
+This is all in-process, synchronous from the caller's perspective, and
+completes in 300–800ms for most queries. There is no reason to introduce
+an external orchestration service here — it would only add latency.
+
+The Query API should be async Python (FastAPI + asyncio):
+  async def handle_query(question: str) -> dict:
+      intent = await classify_intent(question)           # ~150ms
+      ds_task = asyncio.create_task(search_datastore(question))  # parallel
+      neo4j_task = asyncio.create_task(query_auradb(intent))    # parallel
+      ds_results, neo4j_results = await asyncio.gather(ds_task, neo4j_task)
+      context = merge_results(ds_results, neo4j_results)
+      answer = await generate_answer(question, context)  # ~400ms
+      return build_response(answer, context)
+
+Total latency breakdown:
+  classify_intent:      150ms  (Gemini Flash, cached for repeated patterns)
+  search_datastore:     200ms  (parallel with AuraDB)
+  query_auradb:         80ms   (Cypher template, warm page cache)
+  merge + generate:     400ms  (Gemini Pro answer generation)
+  overhead:             50ms   (serialization, Firestore lookup)
+  TOTAL:                ~480ms (dominated by answer generation)
+
+
+6c. AI AGENT LAYER — VERTEX AI AGENT WITH TOOL CALLING
+-------------------------------------------------------
+
+For the end-user conversational interface (the "contract copilot"), deploy a
+Vertex AI Agent (powered by Gemini) with tool calling wired to your Query API.
+
+This is the OUTER orchestrator — it decides which tool to call and in what
+order based on the conversation. Your Query API and its internal routing are
+invisible to the Agent.
+
+Architecture:
+  User ──► Vertex AI Agent (Gemini) ──► Tool calls ──► Query API ──► AuraDB + Data Store
+
+The Agent handles:
+  - Natural language understanding at the conversation level
+  - Multi-turn context (remembers "we were discussing Boeing contracts")
+  - Deciding when to call one tool vs. multiple tools
+  - Formatting the final response for the user (markdown, bullet points, etc.)
+
+The Query API handles:
+  - Authentication and authorization
+  - Query classification and routing
+  - Data retrieval from both stores
+  - Structured response formatting
+
+This separation means:
+  - You can upgrade the Agent model without touching the Query API
+  - You can upgrade the Query API internals without changing the Agent tools
+  - External callers (not using the Agent) call the Query API directly
+  - The Agent is just another caller with the same API contract
+
+TOOL DEFINITIONS FOR THE VERTEX AI AGENT:
+
+  query_contracts(question: str) → dict
+    "Answer any natural language question about Honeywell contract data.
+     Returns: answer, sources (with contract_id, party, dates), confidence."
+
+  get_contract_detail(contract_id: str) → dict
+    "Return full structured details for a specific contract.
+     Returns: parties, milestones, standards, deliverables, lineage."
+
+  list_expiring_contracts(days: int) → list
+    "Return contracts expiring within the next N days.
+     Returns: list of {contract_id, party, expiry_date, days_remaining, value}."
+
+  compare_contracts(contract_id_a: str, contract_id_b: str) → dict
+    "Compare two contracts on key dimensions: parties, value, milestones,
+     standards referenced, and contract type."
+
+  check_contract_status(contract_id: str) → dict
+    "Check ingestion status: is this contract searchable yet?
+     Returns: {auradb_status, datastore_status, ingested_at}."
+
+
+================================================================================
+7. THE ONE THING THAT BREAKS EVERYTHING — THE FIRESTORE MAPPING TABLE
+================================================================================
+
+The Firestore mapping table (contract_id → {datastore_doc_id, aura_node_ids})
+is the only link between what Vertex AI Data Store returns at query time and
+what AuraDB knows about the same contract.
+
+If this table is wrong, missing, or stale:
+  - Semantic search returns a chunk from HC-2023-001
+  - The Query API tries to look up AuraDB nodes for HC-2023-001
+  - The mapping is missing (ingestion partial failure) → no graph context
+  - The LLM answer uses only the text chunk, without structured graph data
+  - The user gets a weaker answer without the graph's precision
+  - NO ERROR IS RAISED. The system silently degrades.
+
+This is the most dangerous failure mode because it is invisible.
+
+REQUIREMENTS FOR THE MAPPING TABLE:
+
+Requirement 1: Transactional write
+  Only write to Firestore when BOTH Branch A and Branch B have confirmed
+  success. Never write a partial mapping (data_store_doc_id only, or
+  aura_node_ids only). Cloud Workflows enforces this by sequencing the
+  Firestore write AFTER the parallel join.
+
+Requirement 2: Versioned entries (not overwritten)
+  When HC-2023-001 revision 3 is ingested, do not overwrite the mapping
+  for revision 2. Both must exist so historical queries work.
+  Firestore document ID: "{contract_id}_{revision}" (never just contract_id)
+
+Requirement 3: Immutable once written
+  After the mapping is written, it should only be updated by a deliberate
+  re-ingestion (which creates a new versioned entry). Firestore security
+  rules: DENY updates to contract_mappings/{doc_id} — only Cloud Workflows
+  service account can write, and only new documents, not overwrites.
+
+Requirement 4: Coverage monitoring (daily job)
+  Every day, run a reconciliation Cloud Run job:
+
+    a) Pull all document_ids from Vertex AI Data Store
+    b) Pull all contract_id + revision combinations from AuraDB:
+         MATCH (c:Contract) RETURN c.contract_id, c.revision
+    c) Query Firestore for all entries in contract_mappings
+    d) Check three things:
+       - Is every Data Store document in Firestore?    (missing → ingestion failed)
+       - Is every AuraDB Contract in Firestore?        (missing → ingestion failed)
+       - Is every Firestore mapping valid?             (AuraDB node IDs still exist)
+    e) For each gap found: publish to contracts-reconciliation-needed Pub/Sub
+       and log to Cloud Logging as a reconciliation_gap event
+    f) Alert: if reconciliation_gap count > 0, send email to operations team
+
+Requirement 5: Fast lookup at query time
+  The Query API looks up the mapping on every hybrid query.
+  Firestore lookup by document ID is ~5ms. This is fast enough.
+  For very high query volume (>100 QPS), cache the Firestore lookup in Redis:
+    cache_key: "mapping:{contract_id}_{revision}"
+    TTL: 24h (mapping rarely changes after successful ingestion)
+
+FIRESTORE DATA MODEL:
+
+  Collection: contract_mappings
+  Document ID: "{contract_id}_{revision}"   e.g. "HC-2023-001_3"
+  Fields:
+    contract_id:           "HC-2023-001"
+    revision:              3
+    datastore_document_id: "projects/xxx/locations/global/collections/default/
+                            dataStores/yyy/branches/0/documents/zzz"
+    aura_node_ids:         ["4:abc123...", "4:def456..."]  ← Neo4j element IDs
+    status:                "complete"  (or "partial_ds_only" / "partial_neo4j_only")
+    ingested_at:           2026-08-19T10:23:00Z
+    ingestion_run_id:      "wf-exec-abc123"  ← Cloud Workflows execution ID
+
+  Index on: contract_id (for listing all revisions of a contract)
+  Index on: status (for reconciliation job: find all non-complete entries)
+  Index on: ingested_at (for recent ingestion audit)
+
+
+================================================================================
+8. FULL ARCHITECTURE DIAGRAM
+================================================================================
+
+INGESTION PATH:
+═══════════════
+
+LEAP (contract frozen)
+       │
+       │  Workato recipe (event-driven or backfill batch)
+       │  Attaches: contract_id, revision, document_type,
+       │            confidentiality_marking, parent_contract_id
+       ▼
+  GCS: gs://contracts-raw/{contract_id}/{revision}/contract.pdf
+       │
+       │  GCS "object finalized" notification
+       ▼
+  Pub/Sub: contracts-landed
+       │
+       ▼
+  Cloud Workflows ─────────────────────────────────────────────────┐
+  (ingestion orchestrator)                                          │
+       │                                                           │ on failure:
+       │  validate metadata                                        │ publish to
+       │                                                           │ contracts-failed
+       ├─────────────────────────┐                                 │
+       │                         │                                 │
+       ▼  PARALLEL               ▼                                 │
+  [BRANCH A]               [BRANCH B]                              │
+  Vertex AI Data Store     Cloud Run: ingestion-service            │
+  Import API               │                                       │
+  (managed pipeline)       ├─► Document AI (OCR, text extract)     │
+       │                   ├─► Gemini/GPT-4o (entity extraction)   │
+       │                   ├─► EntityResolver (canonical names)     │
+       │                   ├─► Neo4j AuraDB (MERGE nodes/edges)    │
+       │                   └─► returns: {aura_node_ids}            │
+       │                                                           │
+  returns: {datastore_doc_id}                                      │
+       │                         │                                 │
+       └──────────┬──────────────┘                                 │
+                  │ JOIN (both must succeed)                        │
+                  ▼                                                 │
+             Firestore                                              │
+             contract_mappings                                      │
+             {contract_id_revision →                               │
+              datastore_doc_id +                                    │
+              aura_node_ids}                                        │
+                  │                                                 │
+                  ▼                                                 │
+             Pub/Sub: ingestion-complete ◄───────────────────────  │
+             (cache warmer, notifications,
+              reconciliation tracker subscribe)
+
+
+QUERY / RETRIEVAL PATH:
+═══════════════════════
+
+  User (chat, dashboard, external system, AI agent)
+       │
+       ▼
+  Vertex AI Agent (Gemini)  ← optional conversational layer
+  [tool: query_contracts]   ← decides which tool to call
+       │
+       ▼
+  API Gateway
+  (rate limiting, API key auth for external callers)
+       │
+       ▼
+  Cloud Run: Query API  ← the unified front door
+  ┌─────────────────────────────────────────────────┐
+  │                                                 │
+  │  1. Auth & access scope check                   │
+  │  2. Redis cache check (cache hit → return)      │
+  │  3. Intent classify (Gemini Flash, ~150ms)      │
+  │     → template_name + slots                     │
+  │                                                 │
+  │  4a. structured intent:                         │
+  │      AuraDB Cypher template (~80ms)             │
+  │                                                 │
+  │  4b. semantic intent:                           │
+  │      Data Store search API (~200ms)             │
+  │                                                 │
+  │  4c. hybrid (PARALLEL):                         │
+  │      AuraDB + Data Store simultaneously         │
+  │      Firestore lookup: chunk → node IDs (~5ms) │
+  │      Merge results                              │
+  │                                                 │
+  │  5. LLM answer generation (Gemini Pro, ~400ms) │
+  │  6. Cache write (Redis)                         │
+  │  7. Structured response + log                   │
+  │                                                 │
+  └─────────────────────────────────────────────────┘
+       │               │
+       ▼               ▼
+  Neo4j AuraDB    Vertex AI
+  (graph facts)   Data Store
+                  (clause text)
+       │               │
+       └───────┬───────┘
+               ▼
+        Firestore mapping
+        (chunk → node bridge)
+               │
+               ▼
+        Unified response
+  {answer, sources, intent, latency_ms}
+
+ANALYTICS PATH (separate from real-time queries):
+  Neo4j AuraDB ──(nightly APOC export)──► GCS ──► BigQuery ──► Looker
+
+
+================================================================================
+9. IMPLEMENTATION PRIORITY ORDER
+================================================================================
+
+WEEK 1: Ingestion foundation
+  □ Create GCS buckets (raw + processed)
+  □ Create Vertex AI Data Store, configure GCS source, test import
+  □ Provision Neo4j AuraDB (start with Professional tier for dev)
+  □ Deploy Cloud Run ingestion service (from ingest_to_neo4j.py)
+  □ Create Pub/Sub topics: contracts-landed, ingestion-complete, contracts-failed
+  □ Wire GCS notification → Pub/Sub (contracts-landed)
+  □ Test Branch B (Neo4j ingestion) end-to-end with 3 sample contracts
+
+WEEK 2: Orchestration and bridge
+  □ Deploy Cloud Workflows definition
+  □ Wire Cloud Workflows to Pub/Sub trigger
+  □ Deploy Firestore mapping service (write + read)
+  □ Test full parallel ingestion (both branches) end-to-end
+  □ Test revision handling (ingest v1 then v2 of same contract)
+  □ Deploy daily reconciliation job
+
+WEEK 3: Query API
+  □ Deploy Query API (Cloud Run, FastAPI)
+  □ Implement query intent classifier (Gemini Flash)
+  □ Implement all 8 Cypher template categories
+  □ Wire Data Store search API
+  □ Wire Firestore mapping lookup
+  □ Implement result merge and LLM answer generation
+  □ Set up Redis (Cloud Memorystore) for query cache
+
+WEEK 4: Access layer and monitoring
+  □ Set up API Gateway (rate limiting, API keys for external callers)
+  □ Implement row-level security (filter by caller organization)
+  □ Set up Cloud Workflows structured logging
+  □ Create Cloud Monitoring dashboard (ingestion + query panels)
+  □ Configure alerting: ingestion failures, mapping gaps, query latency spikes
+  □ First Vertex AI Agent setup with 3 registered tools
+
+WEEK 5+: Production hardening
+  □ Upgrade AuraDB to Enterprise tier
+  □ Implement chunk-level change detection for revision efficiency
+  □ Build human review workflow for POSSIBLE_* edges
+  □ BigQuery export + Looker dashboard
+  □ Workato recipe testing with LEAP (requires LEAP team coordination)
+  □ Load testing: 100 concurrent queries, 50 concurrent ingestion workflows
+
+================================================================================
+END OF DOCUMENT
+Generated: August 2026
+Project: Honeywell Aerospace — Contract Intelligence Platform
+Architecture: GCP (Vertex AI Data Store + Neo4j AuraDB + Cloud Workflows)
+================================================================================

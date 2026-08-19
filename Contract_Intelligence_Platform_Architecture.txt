@@ -1,0 +1,1000 @@
+================================================================================
+  CONTRACT INTELLIGENCE PLATFORM — ARCHITECTURE, DESIGN DECISIONS & MONITORING
+  Honeywell Aerospace | Graph RAG on GCP + Neo4j
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+  1.  Entity Resolution
+  2.  Cypher Template Library (All Query Cases)
+  3.  OCR / LLM Extraction Confidence
+  4.  Latency & Caching Strategy
+  5.  Keeping Two Systems in Sync (Graph + Vector)
+  6.  Why Graph First, Then Vector — The Design Rationale
+  7.  Monitoring & Debugging — GCP Native vs Datadog
+  8.  Recommended GCP-Native Implementation
+  9.  Quick-Reference Decision Matrix
+
+================================================================================
+1. ENTITY RESOLUTION
+================================================================================
+
+THE PROBLEM
+-----------
+Your ingestion pipeline (graph_schema_extractor.py) calls GPT-4o-mini on each
+page independently. The same real-world company appears as:
+  - "Honeywell"
+  - "Honeywell Aerospace"
+  - "Honeywell International Inc."
+  - "HONEYWELL INC"
+
+Without resolution, Neo4j creates four separate Party nodes. Queries that say
+"find all contracts with Honeywell" miss 3/4 of the real data — silently.
+
+THE FIX: THREE-LAYER RESOLUTION
+---------------------------------
+
+Layer 1 — Normalization (cheap, synchronous, zero DB calls)
+  - Lowercase
+  - Strip legal suffixes: Inc, LLC, Corp, International, Aerospace, Ltd, Group
+  - Collapse whitespace, remove punctuation
+  - Result: "Honeywell International Inc." → "honeywell"
+
+Layer 2 — In-process registry (during one ingestion run)
+  - Maintain a dict: {normalized_name → canonical_name} per node type
+  - On each new entity, check the registry first
+  - Fuzzy match (SequenceMatcher) + substring containment
+  - Threshold: 0.85 similarity → same entity, return existing canonical name
+  - This is what EntityResolver in ingest_to_neo4j.py does
+
+Layer 3 — MERGE semantics in Neo4j (across ingestion runs)
+  - Never use CREATE for nodes — always MERGE on canonical_name
+  - If you re-ingest a contract, the same entity converges to the same node
+  - Properties are overwritten with SET n += $props (latest wins)
+
+ADVANCED OPTIONS (not yet implemented)
+---------------------------------------
+  a) Persist the registry between runs (Redis or a dedicated Neo4j lookup index)
+     so entity A resolved to entity B in run 1 is remembered in run 2.
+
+  b) LLM-assisted resolution for ambiguous cases:
+     "Is 'US Air Force' the same as 'USAF'?" — ask GPT with both names and context.
+     Only invoke this when SequenceMatcher score is in the 0.70–0.85 grey zone.
+
+  c) Human-in-the-loop review queue:
+     Run analyze_results.py's duplicate_candidates.csv output through a simple
+     review UI. Human confirms/rejects → confirmed merges are written back to
+     Neo4j as SAME_AS edges, then collapsed in a periodic maintenance job.
+
+  d) SAME_AS edges for audit trail:
+     Instead of merging nodes immediately, write both nodes and a SAME_AS edge.
+     Periodic job collapses SAME_AS clusters into a single canonical node.
+     This preserves the audit trail of what the raw extraction said.
+
+KEY METRICS TO WATCH
+---------------------
+  - entity_resolution_merge_rate: % of entities resolved to an existing node
+    - Healthy: 30–60% (many entities recur across contracts)
+    - Too low (<5%): OCR is producing garbage names, normalization not working
+    - Too high (>80%): threshold too loose, unrelated entities being merged
+
+CYPHER TO AUDIT RESOLUTION
+----------------------------
+  // See all alias relationships
+  MATCH (n) WHERE exists(n.raw_name) AND n.raw_name <> n.canonical_name
+  RETURN n.type, n.canonical_name, collect(n.raw_name) AS aliases
+
+  // Find Party nodes that might still be duplicates (post-ingestion audit)
+  MATCH (a:Party), (b:Party)
+  WHERE a.canonical_name < b.canonical_name
+    AND apoc.text.sorensenDiceSimilarity(a.canonical_name, b.canonical_name) > 0.7
+  RETURN a.canonical_name, b.canonical_name
+
+
+================================================================================
+2. CYPHER TEMPLATE LIBRARY (ALL QUERY CASES)
+================================================================================
+
+WHY TEMPLATES INSTEAD OF FREE-FORM CYPHER GENERATION
+------------------------------------------------------
+Free-form: LLM reads the question → writes Cypher → execute
+  Risk: wrong JOIN, missing WHERE, wrong relationship direction, typos in
+  property names. Fails silently (returns empty set) or throws an error.
+  Impossible to unit test.
+
+Template approach: LLM does two things it is good at:
+  1. Intent classification: "which template does this question need?"
+  2. Slot extraction: "what are the parameter values?"
+  System fills the template. Cypher is never generated at runtime.
+  Every template is pre-validated, has indexes, can be regression tested.
+
+THE CLASSIFICATION PROMPT (used at query time)
+-----------------------------------------------
+  System: "You are a query router for a contract intelligence system.
+  Classify the user query into exactly one of these intent categories:
+  [list below]. Then extract the slot values as JSON.
+  Return: {intent: '...', slots: {key: value, ...}}"
+
+  Example:
+  User: "Show me all milestones for Boeing contracts that reference FAR 52.219"
+  Output: {
+    "intent": "milestones_by_party_and_standard",
+    "slots": {"party_name": "Boeing", "standard_ref": "FAR 52.219"}
+  }
+
+THE TEMPLATE LIBRARY
+---------------------
+Below are templates covering the full query space for a contract intelligence
+platform. Each has a name, the natural language patterns it handles, the
+parameterized Cypher, and any required indexes.
+
+--- CATEGORY A: ENTITY LOOKUP ---
+
+A1. contracts_by_party
+  Handles: "Find contracts with Boeing", "Show Boeing's contracts",
+           "What contracts involve Honeywell?"
+  Slots: party_name (string)
+
+  MATCH (p:Party)<-[:PARTY_TO]-(c:Contract)
+  WHERE p.canonical_name =~ ('(?i).*' + $party_name + '.*')
+  RETURN c.contract_id,
+         c.sales_contract_effective_date,
+         c.sales_contract_expiration_date,
+         c.sales_contract_status,
+         c.sales_contract_or_amendment_value_usd
+  ORDER BY c.sales_contract_expiration_date
+
+  Index: CREATE INDEX party_name IF NOT EXISTS FOR (p:Party) ON (p.canonical_name)
+
+A2. contract_by_id
+  Handles: "Pull up contract HC-2023-001", "Show me contract number X"
+  Slots: contract_id (string)
+
+  MATCH (c:Contract {contract_id: $contract_id})
+  OPTIONAL MATCH (c)-[:PARTY_TO]->(p:Party)
+  OPTIONAL MATCH (c)-[:HAS_MILESTONE]->(m:Milestone)
+  OPTIONAL MATCH (c)-[:REFERENCES_STANDARD]->(s:Standard)
+  RETURN c, collect(DISTINCT p) AS parties,
+         collect(DISTINCT m) AS milestones,
+         collect(DISTINCT s) AS standards
+
+  Index: CREATE INDEX contract_id IF NOT EXISTS FOR (c:Contract) ON (c.contract_id)
+
+A3. party_profile
+  Handles: "Tell me everything about Boeing across all contracts"
+  Slots: party_name (string)
+
+  MATCH (p:Party)
+  WHERE p.canonical_name =~ ('(?i).*' + $party_name + '.*')
+  MATCH (p)<-[:PARTY_TO]-(c:Contract)
+  OPTIONAL MATCH (c)-[:HAS_MILESTONE]->(m:Milestone)
+  RETURN p.canonical_name,
+         count(DISTINCT c) AS total_contracts,
+         sum(toFloat(c.sales_contract_or_amendment_value_usd)) AS total_value,
+         collect(DISTINCT c.contract_id) AS contract_ids,
+         count(m) AS total_milestones
+
+--- CATEGORY B: RELATIONSHIP TRAVERSAL ---
+
+B1. milestones_for_contract
+  Handles: "What milestones are in contract X?", "Show me the schedule for X"
+  Slots: contract_id (string)
+
+  MATCH (c:Contract {contract_id: $contract_id})-[:HAS_MILESTONE]->(m:Milestone)
+  RETURN m.label, m.value, m.date,
+         m._extraction_confidence AS confidence
+  ORDER BY m.date
+
+B2. deliverables_for_contract
+  Handles: "What are the deliverables for contract X?"
+  Slots: contract_id (string)
+
+  MATCH (c:Contract {contract_id: $contract_id})-[:HAS_DELIVERABLE]->(d:Deliverable)
+  RETURN d.name, d.properties, d._extraction_confidence
+
+B3. standards_referenced_by_contract
+  Handles: "Which FAR clauses does contract X reference?"
+  Slots: contract_id (string)
+
+  MATCH (c:Contract {contract_id: $contract_id})-[:REFERENCES_STANDARD]->(s:Standard)
+  RETURN s.name, s.properties
+  ORDER BY s.name
+
+B4. contracts_referencing_standard
+  Handles: "Which contracts reference FAR 52.219?", "Find all contracts with DFARS 252.X"
+  Slots: standard_ref (string, partial match OK)
+
+  MATCH (c:Contract)-[:REFERENCES_STANDARD]->(s:Standard)
+  WHERE s.name CONTAINS $standard_ref
+  RETURN c.contract_id, c.sales_contract_company_name,
+         s.name AS standard, c.sales_contract_status
+  ORDER BY c.contract_id
+
+  Index: CREATE TEXT INDEX standard_name IF NOT EXISTS FOR (s:Standard) ON (s.name)
+
+--- CATEGORY C: MULTI-HOP / CROSS-ENTITY ---
+
+C1. milestones_by_party_and_standard
+  Handles: "What milestones exist in Boeing contracts that reference FAR 52.219?"
+  Slots: party_name, standard_ref
+
+  MATCH (p:Party)<-[:PARTY_TO]-(c:Contract)-[:REFERENCES_STANDARD]->(s:Standard)
+  WHERE p.canonical_name =~ ('(?i).*' + $party_name + '.*')
+    AND s.name CONTAINS $standard_ref
+  MATCH (c)-[:HAS_MILESTONE]->(m:Milestone)
+  RETURN c.contract_id, m.label, m.date, m.value, s.name
+
+C2. shared_contracts_between_parties
+  Handles: "Find contracts where Boeing and Honeywell are both involved"
+  Slots: party_a, party_b
+
+  MATCH (pa:Party)<-[:PARTY_TO]-(c:Contract)-[:PARTY_TO]->(pb:Party)
+  WHERE pa.canonical_name =~ ('(?i).*' + $party_a + '.*')
+    AND pb.canonical_name =~ ('(?i).*' + $party_b + '.*')
+  RETURN c.contract_id, pa.canonical_name, pb.canonical_name
+
+C3. cross_document_references
+  Handles: "What does contract X reference?", "Which contracts reference Exhibit A of X?"
+  Slots: contract_id (string)
+
+  MATCH (c:Contract {contract_id: $contract_id})-[:RELATED_TO|SUPERSEDES]->(linked)
+  RETURN type(r) AS relationship_type, linked.contract_id, linked.sales_contract_status
+
+--- CATEGORY D: CONTRACT LINEAGE ---
+
+D1. contract_family
+  Handles: "Show me the contract family of X", "What are the child contracts of X?"
+  Slots: contract_id, depth (default 3)
+
+  MATCH path = (root:Contract {contract_id: $contract_id})
+               -[:PARENT_OF|SUPERSEDES*1..$depth]->(descendant)
+  RETURN path, [n IN nodes(path) | n.contract_id] AS lineage
+
+D2. contract_ancestry
+  Handles: "What is the parent contract of X?", "Find the master agreement for X"
+  Slots: contract_id
+
+  MATCH path = (child:Contract {contract_id: $contract_id})
+               <-[:PARENT_OF*1..5]-(ancestor)
+  RETURN [n IN nodes(path) | n.contract_id] AS ancestry_chain
+
+D3. superseded_contracts
+  Handles: "What contracts did X replace?", "Find the legacy version of X"
+  Slots: contract_id
+
+  MATCH (c:Contract {contract_id: $contract_id})-[:SUPERSEDES]->(old)
+  RETURN old.contract_id, old.sales_contract_status, old.sales_contract_expiration_date
+
+--- CATEGORY E: TIME-BASED ---
+
+E1. expiring_soon
+  Handles: "Contracts expiring in the next 90 days", "What's coming up for renewal?"
+  Slots: days (integer)
+
+  MATCH (c:Contract)
+  WHERE c.sales_contract_status = 'Active'
+    AND date(c.sales_contract_expiration_date) >= date()
+    AND date(c.sales_contract_expiration_date) <= date() + duration({days: $days})
+  RETURN c.contract_id, c.sales_contract_company_name,
+         c.sales_contract_expiration_date,
+         duration.between(date(), date(c.sales_contract_expiration_date)).days AS days_remaining
+  ORDER BY c.sales_contract_expiration_date
+
+  Index: CREATE INDEX contract_expiry IF NOT EXISTS FOR (c:Contract)
+         ON (c.sales_contract_status, c.sales_contract_expiration_date)
+
+E2. contracts_effective_in_period
+  Handles: "What contracts went active between Jan 2022 and Dec 2023?"
+  Slots: start_date, end_date
+
+  MATCH (c:Contract)
+  WHERE date(c.sales_contract_effective_date) >= date($start_date)
+    AND date(c.sales_contract_effective_date) <= date($end_date)
+  RETURN c.contract_id, c.sales_contract_effective_date,
+         c.sales_contract_company_name
+
+E3. milestones_due_in_period
+  Handles: "What milestones are due next quarter?"
+  Slots: start_date, end_date
+
+  MATCH (c:Contract)-[:HAS_MILESTONE]->(m:Milestone)
+  WHERE date(m.date) >= date($start_date)
+    AND date(m.date) <= date($end_date)
+  RETURN c.contract_id, m.label, m.date, m.value
+  ORDER BY m.date
+
+--- CATEGORY F: FINANCIAL ---
+
+F1. high_value_contracts
+  Handles: "Contracts worth more than $5M", "Show me our biggest contracts"
+  Slots: amount (float)
+
+  MATCH (c:Contract)
+  WHERE toFloat(c.sales_contract_or_amendment_value_usd) > $amount
+  RETURN c.contract_id, c.sales_contract_company_name,
+         toFloat(c.sales_contract_or_amendment_value_usd) AS value_usd
+  ORDER BY value_usd DESC
+
+F2. total_value_by_party
+  Handles: "What is the total contract value with Boeing?"
+  Slots: party_name
+
+  MATCH (p:Party)<-[:PARTY_TO]-(c:Contract)
+  WHERE p.canonical_name =~ ('(?i).*' + $party_name + '.*')
+  RETURN p.canonical_name,
+         sum(toFloat(c.sales_contract_or_amendment_value_usd)) AS total_value_usd,
+         count(c) AS contract_count
+
+F3. value_by_sbg
+  Handles: "Break down contract value by SBG", "What does each business group own?"
+  Slots: (none)
+
+  MATCH (c:Contract)
+  WHERE c.general_contract_sbgs IS NOT NULL
+  RETURN c.general_contract_sbgs AS sbg,
+         sum(toFloat(c.sales_contract_or_amendment_value_usd)) AS total_value,
+         count(c) AS contract_count
+  ORDER BY total_value DESC
+
+--- CATEGORY G: STATUS / CLASSIFICATION ---
+
+G1. contracts_by_status
+  Handles: "Show me all active contracts", "List expired contracts for SBG Aero"
+  Slots: status, sbg (optional)
+
+  MATCH (c:Contract)
+  WHERE c.sales_contract_status = $status
+    AND ($sbg IS NULL OR c.general_contract_sbgs CONTAINS $sbg)
+  RETURN c.contract_id, c.sales_contract_company_name,
+         c.sales_contract_expiration_date
+  ORDER BY c.sales_contract_expiration_date
+
+G2. contracts_by_type
+  Handles: "Show me all government solicitation contracts"
+  Slots: document_type
+
+  MATCH (c:Contract)
+  WHERE c.document_type = $document_type
+  RETURN c.contract_id, c.sales_contract_company_name, c.sales_contract_status
+
+--- CATEGORY H: GLOBAL / AGGREGATION (Graph RAG "global" mode) ---
+
+H1. network_summary
+  Handles: "How many contracts does each party have?", "Who are our biggest partners?"
+  Slots: (none), limit (default 20)
+
+  MATCH (p:Party)<-[:PARTY_TO]-(c:Contract)
+  RETURN p.canonical_name,
+         count(DISTINCT c) AS contract_count,
+         sum(toFloat(c.sales_contract_or_amendment_value_usd)) AS total_value
+  ORDER BY contract_count DESC
+  LIMIT $limit
+
+H2. standard_frequency
+  Handles: "What are the most commonly referenced standards?"
+  Slots: limit (default 20)
+
+  MATCH (c:Contract)-[:REFERENCES_STANDARD]->(s:Standard)
+  RETURN s.name, count(DISTINCT c) AS used_in_contracts
+  ORDER BY used_in_contracts DESC
+  LIMIT $limit
+
+H3. milestone_distribution
+  Handles: "What are the most common milestone types across all contracts?"
+  Slots: (none)
+
+  MATCH (c:Contract)-[:HAS_MILESTONE]->(m:Milestone)
+  RETURN m.label, count(*) AS frequency,
+         avg(toFloat(m.value)) AS avg_value
+  ORDER BY frequency DESC
+
+HOW TO HANDLE QUERIES THAT DON'T FIT ANY TEMPLATE
+----------------------------------------------------
+  1. Log the raw query as "unclassified" with query text
+  2. Fall back to vector search only (semantic retrieval without graph traversal)
+  3. Track frequency: if a pattern appears >10 times, add a new template
+  4. Alert if >5% of queries are unclassified — means coverage gaps
+
+ADDING A NEW TEMPLATE (process)
+---------------------------------
+  1. Identify the pattern from "unclassified" query logs
+  2. Write the Cypher and test it in Neo4j Browser
+  3. Add required indexes, test query plan with EXPLAIN
+  4. Add to the template registry (template_name → {cypher, slots, description})
+  5. Add the intent label to the classification prompt
+  6. Unit test: feed 5 example questions, verify correct template + slot extraction
+
+
+================================================================================
+3. OCR / LLM EXTRACTION CONFIDENCE
+================================================================================
+
+WHY THIS MATTERS
+-----------------
+Your pipeline runs on photographed contract pages (HEIC → JPEG → GPT-4o-mini).
+Two sources of noise:
+  1. Image quality: blurry, rotated, low-contrast pages
+  2. LLM hallucination: GPT invents entities when the page is ambiguous
+
+If low-confidence extractions write hard edges to Neo4j, your graph becomes
+polluted. Future queries return wrong results — and there is no error message,
+just wrong answers.
+
+CONFIDENCE SCORING MODEL
+--------------------------
+Score = base_score * property_modifier * image_quality_modifier
+
+  base_score:
+    - source = "pdf_text" (native PDF, clean extraction): 0.90
+    - source = "photographed" (image → GPT vision): 0.70
+
+  property_modifier:
+    - node has properties with values: +0.05
+    - node has no properties: +0.00
+
+  image_quality_modifier (optional, add to extraction schema):
+    - add "image_quality": "clear" | "moderate" | "poor" to PER_IMAGE_SCHEMA
+    - clear: +0.05, moderate: +0.00, poor: -0.15
+
+  Final caps: min 0.0, max 1.0
+
+CONFIDENCE GATES
+-----------------
+  >= 0.85  → Hard edge written as-is (e.g., PARTY_TO, HAS_MILESTONE)
+  0.75–0.84 → Hard edge + confidence property stored on the edge
+  0.60–0.74 → Edge written as POSSIBLE_{RELATION} (e.g., POSSIBLE_PARTY_TO)
+  < 0.60   → Edge not written to Neo4j; logged to Cloud Logging for review
+
+Query behavior:
+  Default traversal queries skip POSSIBLE_* edges automatically:
+    MATCH (c:Contract)-[:PARTY_TO]->(p:Party)    ← this never matches POSSIBLE_PARTY_TO
+  Auditors can query POSSIBLE_* explicitly:
+    MATCH (c:Contract)-[r]->(p:Party)
+    WHERE type(r) STARTS WITH 'POSSIBLE_'
+    RETURN c.contract_id, type(r), p.canonical_name, r.confidence
+
+PERIODIC REVIEW WORKFLOW
+-------------------------
+  1. Run weekly job: query all POSSIBLE_* edges above confidence 0.65
+  2. Present to human reviewer: "Is Boeing a party to contract HC-2023-001? (confidence: 0.68)"
+  3. Reviewer approves → re-write as hard PARTY_TO edge
+  4. Reviewer rejects → delete the POSSIBLE_ edge, log the false positive
+
+ADDING CONFIDENCE TO YOUR EXTRACTION SCHEMA
+---------------------------------------------
+Modify PER_IMAGE_SCHEMA in analyze_contracts.py to add:
+  "image_quality": {"type": "string", "enum": ["clear", "moderate", "poor"]}
+  "extraction_confidence": {"type": "number"}  -- ask GPT to self-assess (0.0-1.0)
+
+Self-assessed GPT confidence is noisy but better than nothing. Use it as an
+additional signal, not a sole gating criterion.
+
+
+================================================================================
+4. LATENCY & CACHING STRATEGY
+================================================================================
+
+TARGET LATENCIES (for a usable RAG response)
+----------------------------------------------
+  Vector search (Vertex AI)          :  ~50ms
+  Template classification + slots    :  ~200ms (LLM call, cacheable)
+  Neo4j graph traversal (warm cache) :  <100ms
+  Subgraph serialization to text     :  <50ms (for <200 nodes)
+  Final LLM answer generation        :  ~800ms–2s
+  Total end-to-end                   :  <3s (acceptable for contract search)
+
+FOUR-LAYER CACHING ARCHITECTURE
+---------------------------------
+
+LAYER 1: Neo4j Page Cache (built-in, zero code)
+  - Configure in neo4j.conf:
+      dbms.memory.pagecache.size=8G   (size for your graph to live in RAM)
+  - How it works: Neo4j keeps hot graph pages in memory. Repeated traversals
+    on the same nodes/edges never hit disk.
+  - For a contract graph of 500K nodes + 2M edges: ~4–8GB page cache
+  - Monitor: neo4j_page_cache_hit_ratio (target >95%)
+  - First query after restart is slow; subsequent queries are fast
+
+LAYER 2: Application-Level Query Cache (Redis)
+  - Cache the RESULT of a Cypher template execution (serialized subgraph JSON)
+  - Cache key: SHA256(template_name + sorted(slot_values))
+  - TTL strategy: tie TTL to the contract's last_modified timestamp
+      if contract has not changed in 7 days → TTL = 24h
+      if contract was re-ingested in last hour → TTL = 5 minutes
+  - Invalidation: on ingest, delete all Redis keys containing that contract_id
+
+  Implementation:
+    import redis, hashlib, json
+    r = redis.Redis(host='localhost', port=6379)
+
+    def cached_query(template_name: str, slots: dict, execute_fn):
+        key = hashlib.sha256(
+            (template_name + json.dumps(slots, sort_keys=True)).encode()
+        ).hexdigest()
+        cached = r.get(key)
+        if cached:
+            return json.loads(cached)
+        result = execute_fn()
+        r.setex(key, 3600, json.dumps(result))  # 1h TTL
+        return result
+
+  On GCP: Use Cloud Memorystore (managed Redis) instead of self-hosted.
+
+LAYER 3: Precomputed Summaries in Neo4j
+  - For "contract family" queries: store lineage depth as a property
+  - For "party profile" queries: add a PartyProfile node that aggregates stats
+      periodically (e.g., total_contract_value, contract_count, active_count)
+  - Refresh in a nightly batch job, not on every query
+
+  Example: after ingestion of a Party node, update its summary:
+    MATCH (p:Party {canonical_name: $name})<-[:PARTY_TO]-(c:Contract)
+    WITH p, count(c) AS cnt,
+         sum(toFloat(c.sales_contract_or_amendment_value_usd)) AS total
+    SET p.contract_count = cnt, p.total_value_usd = total
+
+LAYER 4: Vector Search Result Cache
+  - Top-k vector results for the same query embedding rarely change
+  - Cache the top-k (chunk_id, score) list keyed by the embedding vector
+  - TTL: 1 hour (safe — embeddings don't change unless you re-index)
+  - On GCP: Vertex AI Vector Search has built-in approximate caching
+
+WHAT NOT TO CACHE
+------------------
+  - Queries with time-relative slots ("expiring in the next 30 days") — always
+    execute fresh; the answer changes daily
+  - Queries against POSSIBLE_* edges during review workflow — must be fresh
+  - Any query where the contract was ingested in the last 60 seconds
+
+
+================================================================================
+5. KEEPING TWO SYSTEMS IN SYNC (GRAPH + VECTOR)
+================================================================================
+
+THE SYNC PROBLEM
+-----------------
+You have Neo4j (graph) and GCP Vector Store (embeddings). They must always
+agree on what data exists. If a contract is deleted from Neo4j but its
+vector embeddings remain, vector search returns results that 404 on graph
+lookup. If Neo4j has a new contract but no vector embedding, semantic search
+misses it.
+
+THE SOLUTION: SINGLE INGESTION EVENT, DUAL WRITE
+--------------------------------------------------
+One atomic function writes to both stores in the same call:
+
+  def ingest_page(page, contract_id):
+      # 1. Write to Neo4j first (entity resolution, MERGE)
+      neo4j_element_ids = write_nodes_and_edges(page)
+
+      # 2. Write to Vector Store with Neo4j IDs as metadata
+      write_vector_embedding(
+          text=page["raw_text"],
+          metadata={
+              "contract_id": contract_id,
+              "neo4j_element_ids": neo4j_element_ids,  # <-- the bridge
+              "page": page["page"]
+          }
+      )
+
+The neo4j_element_ids field in vector metadata is the critical link. When
+vector search returns a chunk at query time, you immediately know which graph
+nodes to start traversal from — no fuzzy lookup needed.
+
+HANDLING PARTIAL FAILURES
+--------------------------
+  Scenario A: Neo4j write succeeds, vector write fails
+    - Log the failure with contract_id and page number
+    - Retry queue (Cloud Tasks or Pub/Sub): re-attempt vector write only
+    - The Neo4j data is already correct; we just need to catch up the vector store
+
+  Scenario B: Vector write succeeds, Neo4j write fails (rarer — Neo4j is local)
+    - Transactional guard: check Neo4j write result before calling vector upsert
+    - If Neo4j throws, skip vector write entirely and log both failures
+
+  Scenario C: Contract deleted
+    - Delete from Neo4j: MATCH (c:Contract {contract_id: $id}) DETACH DELETE c
+    - Delete from Vector Store: call index.remove_datapoints(datapoint_ids=[...])
+    - Both deletes in the same pipeline function
+
+PERIODIC RECONCILIATION JOB (run weekly)
+------------------------------------------
+  1. Pull all contract_ids from Neo4j:
+       MATCH (c:Contract) RETURN c.contract_id
+
+  2. Pull all contract_ids from Vector Store metadata
+     (query with an empty vector, filter by contract_id existence)
+
+  3. Diff the two sets:
+     - In Neo4j but not vector → trigger vector re-ingestion
+     - In vector but not Neo4j → delete orphan vector entries
+     - Log both diffs as reconciliation_gap metrics in Cloud Monitoring
+
+  This catches any edge cases from partial failures.
+
+
+================================================================================
+6. WHY GRAPH FIRST, THEN VECTOR — THE DESIGN RATIONALE
+================================================================================
+
+THE QUESTION
+-------------
+Why write to Neo4j first, then write embeddings to the vector store?
+Why not the other way around (embed → graph), or in parallel?
+
+REASON 1: STABLE IDENTITY IS CREATED BY THE GRAPH, NOT THE TEXT
+-----------------------------------------------------------------
+Neo4j's MERGE operation creates a stable element_id for each entity node.
+Entity resolution (the EntityResolver step) also happens during graph write
+— it collapses "Honeywell" and "Honeywell Aerospace" into one canonical node.
+
+The vector embedding must reference a stable, resolved entity ID.
+If you embed first, you embed "Honeywell" and "Honeywell Aerospace" as two
+separate vectors. Later, when the graph resolves them to one node, you now
+have two floating vector embeddings pointing to the same graph node. You
+can't tell which to delete, and both remain as duplicates in the vector index.
+
+REASON 2: THE BRIDGE MUST BE CREATED AT WRITE TIME, NOT RETROACTIVELY
+-----------------------------------------------------------------------
+The neo4j_element_ids field in vector metadata is what lets you go from
+"this text chunk matched" → "these are the graph nodes to traverse."
+
+If you embed first (before Neo4j writes), those element_ids don't exist yet.
+You'd have to do a second pass to update vector metadata after the graph is
+built — that's two passes per contract, with a gap where the bridge is broken.
+
+Graph-first means element_ids exist at the moment of the vector write, so
+the bridge is written atomically in a single pass.
+
+REASON 3: METADATA ENRICHES THE VECTOR EMBEDDING
+--------------------------------------------------
+The vector store entry for a text chunk is more useful when it carries
+structured metadata: contract_id, effective_date, party_names, sbg.
+This metadata comes from your 54-column structured dataframe and from the
+graph write step (e.g., which Party nodes were created for this contract).
+If you embed first, this metadata isn't available yet.
+
+REASON 4: GRAPH WRITE IS THE HARDER PROBLEM
+--------------------------------------------
+Graph writes can fail due to entity resolution conflicts, schema mismatches,
+Neo4j constraints. You want to catch these first, before incurring the cost
+of vector embedding API calls (which cost money per token/call).
+
+Fail fast: if the graph write fails, skip the vector write and retry both.
+If the vector write fails, the graph is already correct — just retry the
+cheap vector write (no re-extraction needed).
+
+WHEN PARALLEL WRITES MAKE SENSE
+---------------------------------
+Only if both of these are true:
+  a) You are NOT using Neo4j element_ids as the bridge (you have another stable
+     ID, e.g., contract_id + page_number as a deterministic composite key)
+  b) You accept occasional sync drift and have the reconciliation job to fix it
+
+For your architecture, graph-first is the right choice because you need the
+bridge and you want the entity resolution to happen before embedding.
+
+ANALOGY
+--------
+Library catalog system:
+  - The catalog (graph) defines what "the book" is — assigns ISBN (stable ID),
+    handles duplicate editions (entity resolution), links to related books
+  - The full-text search index (vector) points back to catalog entries by ISBN
+  - You build the catalog first so every full-text result resolves to the
+    correct, deduplicated, properly-attributed book record
+  - If you build full-text search first, your results point at nothing
+
+
+================================================================================
+7. MONITORING & DEBUGGING — GCP NATIVE vs DATADOG
+================================================================================
+
+SIDE-BY-SIDE COMPARISON
+------------------------
+
+                        GCP Native Services         Datadog
+                        -------------------         -------
+Cost                    Included in GCP infra       ~$15–25/host/month + APM
+Setup                   Zero config for GCP svc     Agent install + config
+Infrastructure          Native (Vertex, GCS, etc.)  Requires agent on each host
+Neo4j monitoring        Prometheus scrape only       Better Neo4j dashboard avail
+Application traces      Cloud Trace                 Better APM, code-level spans
+Log analysis            Cloud Logging + Log Analytics  Better correlation across svc
+Alerting                Cloud Alerting (functional)  More flexible, PagerDuty native
+Dashboards              Cloud Monitoring             More powerful drag-and-drop
+On-prem / multi-cloud   GCP only                    Any infrastructure
+
+RECOMMENDATION FOR YOUR PROJECT
+---------------------------------
+Use GCP native (Cloud Monitoring + Cloud Logging + Cloud Trace) because:
+  1. All your infrastructure is on GCP (Vertex AI, Cloud Datastore, GCS)
+  2. GCP native services are pre-wired — no agent, no setup cost
+  3. Cloud Logging structured JSON logs give you queryable per-contract metrics
+     without any SDK overhead
+  4. Cost: effectively free for your data volumes
+
+Add Datadog only if:
+  - Neo4j is on-prem or a separate cloud (Datadog has a better Neo4j integration)
+  - Your team already uses Datadog for other systems (unified pane of glass)
+  - You need deep APM traces with code-level profiling across the query path
+
+WHAT TO MONITOR (SPECIFIC TO THIS ARCHITECTURE)
+------------------------------------------------
+
+INGESTION PIPELINE METRICS
+  - contracts_ingested_total             : counter (success vs error)
+  - pages_processed_total               : counter
+  - entity_resolution_merge_rate        : gauge (merges / total entities)
+  - low_confidence_edge_rate            : gauge (POSSIBLE_* / total edges)
+  - neo4j_write_latency_ms             : histogram
+  - vector_upsert_latency_ms           : histogram
+  - ingestion_errors_total              : counter (by error_type)
+  - metadata_lookup_hit_rate            : gauge (structured data vs LLM fallback)
+
+GRAPH HEALTH METRICS
+  - neo4j_node_count (by label)         : gauge
+  - neo4j_edge_count (by type)          : gauge
+  - possible_edge_ratio                 : gauge — if >30%, OCR quality has degraded
+  - isolated_node_count                 : gauge — nodes with zero edges
+  - entity_resolution_registry_size     : gauge — total unique canonical entities
+
+QUERY PERFORMANCE METRICS
+  - query_latency_ms (by template_name) : histogram — find slow templates
+  - cache_hit_rate                      : gauge (Redis / Memorystore)
+  - vector_search_latency_ms           : histogram
+  - neo4j_page_cache_hit_ratio         : gauge (built-in Neo4j metric)
+  - unclassified_query_rate            : gauge — queries not matching any template
+  - rag_end_to_end_latency_ms          : histogram — total user-facing latency
+
+ALERTS TO SET UP
+  - possible_edge_ratio > 30%           : OCR confidence has degraded
+  - neo4j_page_cache_hit_ratio < 90%   : increase page cache or add RAM
+  - ingestion_errors_total > 5 in 1hr  : ingestion pipeline broken
+  - unclassified_query_rate > 5%        : add new query templates
+  - isolated_node_count increase > 10%  : entity resolution may have broken
+  - reconciliation_gap > 0             : sync drift between Neo4j and vector store
+  - cache_hit_rate < 40%               : cache TTLs may be too short
+
+
+================================================================================
+8. RECOMMENDED GCP-NATIVE IMPLEMENTATION
+================================================================================
+
+SERVICES TO USE
+----------------
+  Cloud Logging     — structured logs from ingestion pipeline (no SDK overhead)
+  Cloud Monitoring  — metrics, dashboards, alerts
+  Cloud Trace       — distributed tracing across ingestion → Neo4j → Vector
+  Error Reporting   — automatic grouping of ingestion exceptions
+  Cloud Memorystore — managed Redis for application-level query cache
+  Pub/Sub           — retry queue for failed vector upserts
+
+STEP 1: STRUCTURED LOGGING (add to ingest_to_neo4j.py)
+--------------------------------------------------------
+  import google.cloud.logging
+  from google.cloud.logging.handlers import CloudLoggingHandler
+  import logging
+
+  gcp_log_client = google.cloud.logging.Client()
+  handler = CloudLoggingHandler(gcp_log_client, name="contract-ingestion")
+  log = logging.getLogger()
+  log.addHandler(handler)
+
+  # After ingesting each contract:
+  log.info("contract_ingested", extra={"json_fields": {
+      "contract_id": contract_id,
+      "pages_processed": page_count,
+      "nodes_created": stats["nodes"],
+      "edges_created": stats["edges"],
+      "possible_edges": stats["possible_edges"],
+      "entity_merges": stats["merges"],
+      "metadata_hits": stats["metadata_hits"],
+      "duration_ms": int(elapsed * 1000),
+      "source": source,
+  }})
+
+  Then in Cloud Logging → Log-based Metrics, create custom metrics on these fields:
+    metric: contract_ingestion_duration    field: jsonPayload.duration_ms
+    metric: entity_merge_count             field: jsonPayload.entity_merges
+    metric: possible_edge_count            field: jsonPayload.possible_edges
+
+STEP 2: DISTRIBUTED TRACING (add to ingestion pipeline)
+---------------------------------------------------------
+  from opentelemetry import trace
+  from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
+  from opentelemetry.sdk.trace import TracerProvider
+  from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+  provider = TracerProvider()
+  provider.add_span_processor(BatchSpanProcessor(CloudTraceSpanExporter()))
+  trace.set_tracer_provider(provider)
+  tracer = trace.get_tracer("contract-ingestion")
+
+  # In ingest_page():
+  with tracer.start_as_current_span("ingest_page") as span:
+      span.set_attribute("contract.id", contract_id)
+      span.set_attribute("page.number", page["page"])
+
+      with tracer.start_as_current_span("entity_resolution"):
+          # EntityResolver.resolve() calls
+
+      with tracer.start_as_current_span("neo4j_write"):
+          # Neo4j MERGE calls
+          span.set_attribute("neo4j.nodes_written", len(nodes))
+
+      with tracer.start_as_current_span("vector_upsert"):
+          # Vertex AI upsert
+          span.set_attribute("vector.chunk_id", chunk_id)
+
+  This gives you a flame graph in Cloud Trace for every ingestion: you can see
+  exactly which step (entity resolution? Neo4j write? vector upsert?) is slow.
+
+STEP 3: NEO4J METRICS VIA PROMETHEUS
+--------------------------------------
+  Neo4j exposes Prometheus metrics at http://neo4j-host:2004/metrics
+  (enable in neo4j.conf: metrics.prometheus.enabled=true)
+
+  Use Cloud Monitoring's Managed Prometheus collection:
+    1. Deploy prometheus-to-sd sidecar or Cloud Ops Agent on the Neo4j host
+    2. Scrape :2004/metrics
+    3. Metrics appear in Cloud Monitoring under prometheus/neo4j_*
+
+  Key Neo4j metrics to watch:
+    neo4j_page_cache_hit_ratio            : target >95%
+    neo4j_bolt_connections_opened_total   : watch for connection leaks
+    neo4j_transaction_committed_total     : throughput
+    neo4j_database_store_size_total       : graph size growth
+
+STEP 4: ERROR REPORTING
+------------------------
+  from google.cloud import error_reporting
+  error_client = error_reporting.Client()
+
+  # In your exception handler:
+  except Exception as e:
+      error_client.report_exception()   # auto-groups by stack trace
+      log.error("ingestion_failed", extra={"json_fields": {
+          "contract_id": contract_id,
+          "error": str(e),
+          "error_type": type(e).__name__,
+      }})
+
+  Error Reporting groups identical exceptions together — after 10 runs you'll
+  see "Neo4jError: Schema constraint violation x47" as a single alert, not
+  47 separate notifications.
+
+STEP 5: DASHBOARDS IN CLOUD MONITORING
+----------------------------------------
+  Create a dashboard with these panels:
+
+  Panel 1: Ingestion Health (last 24h)
+    - contracts_ingested_total (counter)
+    - ingestion_errors_total (counter)
+    - avg ingestion_duration_ms
+
+  Panel 2: Graph Quality
+    - possible_edge_ratio (gauge)
+    - entity_resolution_merge_rate (gauge)
+    - isolated_node_count (gauge)
+
+  Panel 3: Query Performance
+    - p50/p95/p99 of rag_end_to_end_latency_ms
+    - cache_hit_rate
+    - neo4j_page_cache_hit_ratio
+
+  Panel 4: Neo4j Health
+    - neo4j_page_cache_hit_ratio
+    - neo4j_bolt_connections_opened_total
+    - neo4j_database_store_size_total
+
+STEP 6: ALERTING POLICIES
+---------------------------
+  In Cloud Monitoring → Alerting → Create Policy:
+
+  Alert 1: OCR Quality Degradation
+    Condition: possible_edge_ratio > 0.30 for 1 hour
+    Channel: Email / PagerDuty / Slack webhook
+    Playbook: Check recent source images for quality issues; review extraction
+              logs for the affected contracts
+
+  Alert 2: Ingestion Pipeline Down
+    Condition: ingestion_errors_total rate > 5 in 60 min
+    Playbook: Check Cloud Logging for error_type; most common causes are
+              Neo4j connection refused or Vertex AI quota exceeded
+
+  Alert 3: Cache Degradation
+    Condition: neo4j_page_cache_hit_ratio < 0.90 for 30 min
+    Playbook: neo4j.conf pagecache.size needs to be increased; or a large
+              new batch of contracts was ingested and the cache is cold
+
+  Alert 4: Query Template Gap
+    Condition: unclassified_query_rate > 0.05
+    Playbook: Pull logs for unclassified queries, identify patterns, add
+              new templates to the template library
+
+
+DEBUGGING SPECIFIC PROBLEMS
+-----------------------------
+
+Problem: "My query returns no results but I know the data exists"
+  Step 1: Check entity resolution — does "Boeing" in the query match the
+          canonical_name in Neo4j? Run:
+            MATCH (p:Party) WHERE p.canonical_name CONTAINS 'Boeing' RETURN p
+  Step 2: Check confidence gates — is the edge a POSSIBLE_PARTY_TO instead of
+          PARTY_TO? Run:
+            MATCH (c:Contract)-[r]->(p:Party {canonical_name: 'Boeing'})
+            RETURN type(r), r.confidence
+  Step 3: Check template slot extraction — log the classified intent and
+          extracted slots before executing the template
+
+Problem: "Ingestion is slow"
+  Step 1: Open Cloud Trace — look at the flame graph, find which span is slowest
+  Step 2: If neo4j_write span is slow: check neo4j_page_cache_hit_ratio;
+          increase pagecache.size; check for missing indexes
+  Step 3: If entity_resolution span is slow: registry is too large; consider
+          batching or pre-loading from a persistent store
+
+Problem: "Graph has duplicate Party nodes after ingestion"
+  Step 1: Check SIMILARITY_THRESHOLD in EntityResolver — may be too high
+  Step 2: Check if legal suffix stripping is covering all variants
+          (e.g., "Aerospace" may not be in the strip list)
+  Step 3: Run analyze_results.py to surface duplicate_candidates.csv
+  Step 4: Manually merge in Neo4j:
+            MATCH (a:Party {canonical_name: 'Honeywell Aerospace'})
+            MATCH (b:Party {canonical_name: 'Honeywell'})
+            CALL apoc.refactor.mergeNodes([a, b], {properties: 'combine'})
+            YIELD node RETURN node
+
+Problem: "Vector search returns results but graph lookup misses"
+  This means the bridge (neo4j_element_ids in vector metadata) is stale.
+  Step 1: Run the reconciliation job to find orphan vector entries
+  Step 2: Check that the contract still exists in Neo4j
+  Step 3: If the contract was re-ingested (new element_ids generated), the
+          vector metadata must be updated — this is why you pass element_ids
+          at write time, not as a post-hoc update
+
+
+================================================================================
+9. QUICK-REFERENCE DECISION MATRIX
+================================================================================
+
+DECISION: Which store to query?
+  Semantic / "find similar" / "clauses about X"     → Vector search first
+  Structural / "who is involved" / "what milestones" → Graph (Cypher template)
+  Named entity in query (party, contract number)     → Graph first, vector second
+  Global / aggregate / "how many" / "most common"    → Graph aggregation query
+  Ambiguous                                          → Both, merge results
+
+DECISION: Which Cypher template category?
+  Party / company names in query    → Category A (entity lookup)
+  "milestones" / "deliverables"     → Category B (relationship traversal)
+  Two entities + a condition        → Category C (multi-hop)
+  "parent" / "child" / "supersedes" → Category D (lineage)
+  Date / time / "expiring" / "due"  → Category E (time-based)
+  "$" / "value" / "worth"           → Category F (financial)
+  "active" / "expired" / "status"   → Category G (status / classification)
+  "most common" / "breakdown" / "all" → Category H (global aggregation)
+  None of the above                 → Fall back to vector search, log query
+
+DECISION: Write confidence level?
+  Native PDF text, has properties          → 0.95 (hard edge)
+  Photographed, has properties             → 0.75 (hard edge + confidence property)
+  Photographed, no properties, poor image  → 0.55 (POSSIBLE_* edge)
+  Any source, confidence < 0.60           → Do not write; log for review
+
+DECISION: Cache or not?
+  Same template + same slots as recent query  → Return from Redis cache
+  Time-relative slots ("expiring soon")       → Never cache, always execute
+  POSSIBLE_* edge review queries              → Never cache
+  First query after new ingestion (<60s ago)  → Bypass cache
+
+DECISION: GCP Monitoring vs Datadog?
+  All infrastructure on GCP, small team       → GCP native (Cloud Monitoring)
+  Neo4j on-prem, cross-cloud visibility       → Datadog
+  Team already uses Datadog company-wide      → Datadog (unified pane)
+  Just need ingestion + query metrics on GCP  → GCP native is sufficient
+
+================================================================================
+END OF DOCUMENT
+Generated: August 2026
+Project: Honeywell Aerospace — Contract Intelligence Platform
+================================================================================
